@@ -199,10 +199,11 @@ impl AudioAsset {
     }
     /// Decode to f32 mono samples.
     pub fn samples(&self) -> Vec<f32> {
-        B64.decode(&self.data)
-            .unwrap_or_default()
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+        let bytes = B64.decode(&self.data).unwrap_or_default();
+        let (chunks, _) = bytes.as_chunks::<2>();
+        chunks
+            .iter()
+            .map(|&[b0, b1]| i16::from_le_bytes([b0, b1]) as f32 / 32768.0)
             .collect()
     }
     pub fn duration_secs(&self) -> f32 {

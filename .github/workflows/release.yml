@@ -19,19 +19,15 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             bin_name: kymion
-            archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
             bin_name: kymion
-            archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-13
             bin_name: kymion
-            archive: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             bin_name: kymion.exe
-            archive: zip
 
     steps:
       - name: Checkout repository
@@ -50,28 +46,19 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p kymion-cli --target ${{ matrix.target }}
 
-      - name: Package archive (Unix)
-        if: matrix.archive == 'tar.gz'
+      - name: Package archive
+        shell: bash
         run: |
           mkdir -p staging
           cp target/${{ matrix.target }}/release/${{ matrix.bin_name }} staging/
           cp AGENTS.md README.md staging/
-          cd staging && tar -czvf ../kymion-${{ github.ref_name }}-${{ matrix.target }}.tar.gz *
-
-      - name: Package archive (Windows)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          mkdir staging
-          cp target/${{ matrix.target }}/release/${{ matrix.bin_name }} staging/
-          cp AGENTS.md README.md staging/
-          Compress-Archive -Path staging/* -DestinationPath kymion-${{ github.ref_name }}-${{ matrix.target }}.zip
+          tar -czvf kymion-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C staging .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: kymion-${{ matrix.target }}
-          path: kymion-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive }}
+          path: kymion-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
 
   publish-release:
     name: Publish GitHub Release
