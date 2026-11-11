@@ -156,7 +156,7 @@ pub fn import_midi(bytes: &[u8]) -> Result<Project> {
         let kind = if is_vocal || track_name.to_lowercase().contains("vocal") || track_name.to_lowercase().contains("voice") {
             TrackKind::Vocal { voice: "default".into() }
         } else {
-            TrackKind::Instrument { waveform: Waveform::Pluck }
+            TrackKind::instrument(Waveform::Pluck)
         };
 
         let mut trk = Track::new(track_id, track_name, kind);

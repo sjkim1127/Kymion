@@ -84,6 +84,23 @@ enum Cmd {
         #[arg(short, long)]
         out: PathBuf,
     },
+    /// Import a SoundFont 2 (.sf2) file as a project soundfont asset.
+    ImportSoundfont {
+        project: PathBuf,
+        sf2: PathBuf,
+        /// Optional custom name for the soundfont.
+        #[arg(long)]
+        name: Option<String>,
+        /// Assign this soundfont to an instrument track id.
+        #[arg(long)]
+        track: Option<u32>,
+        /// SoundFont bank number (default 0).
+        #[arg(long, default_value_t = 0)]
+        bank: u16,
+        /// SoundFont preset/patch number (default 0).
+        #[arg(long, default_value_t = 0)]
+        preset: u16,
+    },
 }
 
 fn run(cli: Cli) -> Result<Value, String> {
@@ -226,6 +243,37 @@ fn run(cli: Cli) -> Result<Value, String> {
                 "out": out,
                 "tracks": p.tracks.len(),
                 "notes": p.tracks.iter().map(|t| t.notes.len()).sum::<usize>()
+            }))
+        }
+        Cmd::ImportSoundfont { project, sf2, name, track, bank, preset } => {
+            let bytes = std::fs::read(&sf2).map_err(|e| format!("{}: {e}", sf2.display()))?;
+            let sf_name = name.unwrap_or_else(|| {
+                sf2.file_stem().and_then(|s| s.to_str()).unwrap_or("soundfont").to_string()
+            });
+            let presets = kymion_audio::list_soundfont_presets(&bytes);
+            let mut e = Engine::new(load(&project)?);
+            let asset_id = e.import_soundfont(&sf_name, &bytes);
+
+            if let Some(track_id) = track {
+                e.apply(Command::SetTrackSoundfont {
+                    track: track_id,
+                    soundfont: Some(kymion_core::SoundfontConfig {
+                        asset: asset_id,
+                        bank,
+                        preset,
+                    }),
+                })
+                .map_err(|er| er.to_string())?;
+            }
+
+            std::fs::write(&project, e.project.to_json()).map_err(|e| e.to_string())?;
+            Ok(json!({
+                "ok": true,
+                "asset_id": asset_id,
+                "name": sf_name,
+                "bytes": bytes.len(),
+                "presets_count": presets.len(),
+                "assigned_track": track,
             }))
         }
     }

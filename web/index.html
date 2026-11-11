@@ -50,12 +50,14 @@
   <div class="divider"></div>
   <button id="import-midi">Import MIDI</button>
   <button id="export-midi">Export MIDI</button>
+  <button id="import-soundfont" title="Load SoundFont (.sf2) instrument">Import SF2</button>
   <button id="import-audio">Import Audio</button>
   <button id="wav">Export WAV</button>
   <button id="save">Save</button>
   <button id="load">Load</button>
   <input id="file" type="file" accept=".json" hidden>
   <input id="midi-file" type="file" accept=".mid,.midi" hidden>
+  <input id="sf2-file" type="file" accept=".sf2,.soundfont" hidden>
   <input id="audio-file" type="file" accept="audio/*,.wav,.mp3,.ogg,.flac" hidden>
 </header>
 <main>
@@ -67,6 +69,9 @@
       <button id="add-vocal">+ Vocal</button>
       <button id="add-audio">+ Audio</button>
     </div>
+
+    <h2>Instrument / SoundFont</h2>
+    <div id="inst-panel"></div>
 
     <h2>Automation (selected track)</h2>
     <div class="row"><select id="auto-param"><option value="gain">Gain</option><option value="pan">Pan</option></select>

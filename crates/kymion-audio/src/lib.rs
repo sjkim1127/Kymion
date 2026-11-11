@@ -1,9 +1,31 @@
 //! Kymion audio engine: offline renderer, mixer, DSP effects chain, analysis, WAV export.
 
-use kymion_core::{eval_auto, FxInstance, FxKind, Project, Track, TrackKind, Waveform, PPQ};
+use kymion_core::{eval_auto, FxInstance, FxKind, Project, SoundfontConfig, Track, TrackKind, Waveform, PPQ};
 use kymion_dsp::{midi_to_hz, Adsr, Compressor, Eq3Band, Osc, StereoDelay, StereoReverb};
 use kymion_vocal::{render_track as render_vocal, FormantVoice};
 use serde::Serialize;
+
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+pub struct SoundfontPresetInfo {
+    pub bank: u16,
+    pub preset: u16,
+    pub name: String,
+}
+
+pub fn list_soundfont_presets(bytes: &[u8]) -> Vec<SoundfontPresetInfo> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let Ok(sf) = rustysynth::SoundFont::new(&mut cursor) else {
+        return vec![];
+    };
+    sf.get_presets()
+        .iter()
+        .map(|p| SoundfontPresetInfo {
+            bank: p.get_bank_number() as u16,
+            preset: p.get_patch_number() as u16,
+            name: p.get_name().to_string(),
+        })
+        .collect()
+}
 
 #[derive(Clone, Debug)]
 pub struct Stereo {
@@ -47,6 +69,93 @@ fn render_instrument_into(p: &Project, t: &Track, wf: Waveform, sr: u32, buf: &m
                 Waveform::Pluck => osc.saw(hz, srf) * 0.5,
             };
             buf[off + i] += s * env.next() * vel * 0.5;
+        }
+    }
+}
+
+fn render_soundfont_into(
+    p: &Project,
+    t: &Track,
+    sf_cfg: &SoundfontConfig,
+    sr: u32,
+    out_l: &mut [f32],
+    out_r: &mut [f32],
+) {
+    let Some(sf_asset) = p.soundfonts.iter().find(|sf| sf.id == sf_cfg.asset) else {
+        return;
+    };
+    let sf_bytes = sf_asset.bytes();
+    if sf_bytes.is_empty() {
+        return;
+    }
+    let mut cursor = std::io::Cursor::new(sf_bytes);
+    let Ok(soundfont) = rustysynth::SoundFont::new(&mut cursor) else {
+        return;
+    };
+    let soundfont = std::sync::Arc::new(soundfont);
+    let settings = rustysynth::SynthesizerSettings::new(sr as i32);
+    let Ok(mut synth) = rustysynth::Synthesizer::new(&soundfont, &settings) else {
+        return;
+    };
+
+    // Bank and Program change on channel 0
+    let bank = sf_cfg.bank as i32;
+    synth.process_midi_message(0, 0xB0, 0x00, bank >> 7);
+    synth.process_midi_message(0, 0xB0, 0x20, bank & 0x7F);
+    synth.process_midi_message(0, 0xC0, sf_cfg.preset as i32, 0);
+
+    let srf = sr as f32;
+    let total_samples = out_l.len().min(out_r.len());
+
+    #[derive(Clone, Copy)]
+    enum MidiEvt {
+        NoteOn { key: i32, vel: i32 },
+        NoteOff { key: i32 },
+    }
+
+    let mut events: Vec<(usize, MidiEvt)> = Vec::with_capacity(t.notes.len() * 2);
+    for n in &t.notes {
+        let on = (p.ticks_to_secs(n.start) * srf) as usize;
+        let off = (p.ticks_to_secs(n.start + n.duration) * srf) as usize;
+        if on < total_samples {
+            events.push((on, MidiEvt::NoteOn { key: n.pitch as i32, vel: n.velocity as i32 }));
+        }
+        if off < total_samples {
+            events.push((off, MidiEvt::NoteOff { key: n.pitch as i32 }));
+        }
+    }
+    events.sort_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| match (&a.1, &b.1) {
+            (MidiEvt::NoteOff { .. }, MidiEvt::NoteOn { .. }) => std::cmp::Ordering::Less,
+            (MidiEvt::NoteOn { .. }, MidiEvt::NoteOff { .. }) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        })
+    });
+
+    let mut cur_sample = 0;
+    let mut evt_idx = 0;
+
+    while cur_sample < total_samples {
+        let next_sample = if evt_idx < events.len() {
+            events[evt_idx].0.min(total_samples)
+        } else {
+            total_samples
+        };
+
+        if next_sample > cur_sample {
+            synth.render(
+                &mut out_l[cur_sample..next_sample],
+                &mut out_r[cur_sample..next_sample],
+            );
+            cur_sample = next_sample;
+        }
+
+        while evt_idx < events.len() && events[evt_idx].0 <= cur_sample {
+            match events[evt_idx].1 {
+                MidiEvt::NoteOn { key, vel } => synth.note_on(0, key, vel),
+                MidiEvt::NoteOff { key } => synth.note_off(0, key),
+            }
+            evt_idx += 1;
         }
     }
 }
@@ -340,8 +449,19 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
 
     for t in p.tracks.iter().filter(|t| !t.mute && (!any_solo || t.solo)) {
         mono.fill(0.0);
+        trk_l.fill(0.0);
+        trk_r.fill(0.0);
+        let mut is_stereo = false;
+
         match &t.kind {
-            TrackKind::Instrument { waveform } => render_instrument_into(p, t, *waveform, sr, &mut mono),
+            TrackKind::Instrument { waveform, soundfont } => {
+                if let Some(sf_cfg) = soundfont {
+                    render_soundfont_into(p, t, sf_cfg, sr, &mut trk_l, &mut trk_r);
+                    is_stereo = true;
+                } else {
+                    render_instrument_into(p, t, *waveform, sr, &mut mono);
+                }
+            }
             TrackKind::Vocal { .. } => {
                 let v = render_vocal(p, t, &FormantVoice, sr);
                 let copy_len = v.len().min(total_samples);
@@ -350,28 +470,42 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
             TrackKind::Audio => render_audio_track_into(p, t, sr, &mut mono),
         };
 
-        trk_l.fill(0.0);
-        trk_r.fill(0.0);
-
         let static_pan = {
             let a = (t.pan + 1.0) * std::f32::consts::FRAC_PI_4;
             (a.cos(), a.sin())
         };
         let automated = !t.gain_auto.is_empty() || !t.pan_auto.is_empty();
 
-        for i in 0..total_samples {
-            let s = mono[i];
-            let (gain, (pl, pr)) = if automated {
-                let tick = i as f32 * ticks_per_sample;
-                let g = eval_auto(&t.gain_auto, tick, t.gain);
-                let pan = eval_auto(&t.pan_auto, tick, t.pan);
-                let a = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
-                (g, (a.cos(), a.sin()))
-            } else {
-                (t.gain, static_pan)
-            };
-            trk_l[i] = s * gain * pl;
-            trk_r[i] = s * gain * pr;
+        if is_stereo {
+            for i in 0..total_samples {
+                let (gain, pan) = if automated {
+                    let tick = i as f32 * ticks_per_sample;
+                    let g = eval_auto(&t.gain_auto, tick, t.gain);
+                    let p_val = eval_auto(&t.pan_auto, tick, t.pan);
+                    (g, p_val)
+                } else {
+                    (t.gain, t.pan)
+                };
+                let l_pan = if pan <= 0.0 { 1.0 } else { 1.0 - pan };
+                let r_pan = if pan >= 0.0 { 1.0 } else { 1.0 + pan };
+                trk_l[i] = trk_l[i] * gain * l_pan;
+                trk_r[i] = trk_r[i] * gain * r_pan;
+            }
+        } else {
+            for i in 0..total_samples {
+                let s = mono[i];
+                let (gain, (pl, pr)) = if automated {
+                    let tick = i as f32 * ticks_per_sample;
+                    let g = eval_auto(&t.gain_auto, tick, t.gain);
+                    let pan = eval_auto(&t.pan_auto, tick, t.pan);
+                    let a = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+                    (g, (a.cos(), a.sin()))
+                } else {
+                    (t.gain, static_pan)
+                };
+                trk_l[i] = s * gain * pl;
+                trk_r[i] = s * gain * pr;
+            }
         }
 
         // Apply track FX insert chain
@@ -519,7 +653,7 @@ mod tests {
         let asset = e.import_audio("tone", 44100, &tone);
         let a = e.apply(Command::AddTrack { name: "audio".into(), kind: TrackKind::Audio }).unwrap().track_id.unwrap();
         e.apply(Command::AddClip { track: a, asset, start: 0, gain: None, offset_ticks: None, duration_ticks: None }).unwrap();
-        let i = e.apply(Command::AddTrack { name: "inst".into(), kind: TrackKind::Instrument { waveform: Waveform::Sine } }).unwrap().track_id.unwrap();
+        let i = e.apply(Command::AddTrack { name: "inst".into(), kind: TrackKind::instrument(Waveform::Sine) }).unwrap().track_id.unwrap();
         e.apply(Command::AddNote { track: i, start: 0, duration: 480, pitch: 60, velocity: 100, lyric: None }).unwrap();
 
         let both = analyze(&render(&e.project)).rms;

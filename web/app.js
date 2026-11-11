@@ -76,6 +76,7 @@ function refresh() {
   $("tool-select").classList.toggle("active", tool === "select");
 
   renderTracks();
+  renderInstrumentPanel();
   renderFxRacks();
   renderExpr();
   dirty = true;
@@ -103,9 +104,10 @@ function renderTracks() {
       const d = box.children[i];
       if (!d) return;
       d.className = "trk" + (t.id === sel ? " sel" : "");
-      const icon = t.kind.type === "vocal" ? "🎤" : t.kind.type === "audio" ? "🔊" : "🎹";
+      const icon = t.kind.type === "vocal" ? "🎤" : t.kind.type === "audio" ? "🔊" : (t.kind.soundfont ? "🎻" : "🎹");
+      const sfTag = t.kind.soundfont ? " [SF2]" : "";
       const nameEl = d.querySelector(".tname");
-      if (nameEl) nameEl.textContent = `${icon} ${t.name}${t.fx.length ? ` [${t.fx.length} FX]` : ""}`;
+      if (nameEl) nameEl.textContent = `${icon} ${t.name}${sfTag}${t.fx.length ? ` [${t.fx.length} FX]` : ""}`;
 
       const muteBtn = d.querySelector('[data-a="mute"]');
       if (muteBtn) muteBtn.className = "ms " + (t.mute ? "on-mute" : "");
@@ -127,13 +129,14 @@ function renderTracks() {
   renderedTrackKey = trackKey;
   box.innerHTML = "";
   for (const t of P.tracks) {
-    const icon = t.kind.type === "vocal" ? "🎤" : t.kind.type === "audio" ? "🔊" : "🎹";
+    const icon = t.kind.type === "vocal" ? "🎤" : t.kind.type === "audio" ? "🔊" : (t.kind.soundfont ? "🎻" : "🎹");
+    const sfTag = t.kind.soundfont ? " [SF2]" : "";
     const d = document.createElement("div");
     d.className = "trk" + (t.id === sel ? " sel" : "");
     d.dataset.tid = t.id;
     d.innerHTML = `
       <div style="display:flex;align-items:center;width:100%;gap:4px">
-        <span class="tname" title="Double-click to rename">${icon} ${t.name}${t.fx.length ? ` [${t.fx.length} FX]` : ""}</span>
+        <span class="tname" title="Double-click to rename">${icon} ${t.name}${sfTag}${t.fx.length ? ` [${t.fx.length} FX]` : ""}</span>
         <span class="spacer" style="flex:1"></span>
         <button class="ms ${t.mute ? "on-mute" : ""}" data-a="mute" title="Mute">M</button>
         <button class="ms ${t.solo ? "on-solo" : ""}" data-a="solo" title="Solo">S</button>
@@ -213,6 +216,115 @@ function renderFxRacks() {
   if (t) renderFxList($("fx-rack"), t.fx, t.id);
   else $("fx-rack").innerHTML = `<div class="empty">Select a track.</div>`;
   renderFxList($("master-fx-rack"), P.master_fx, null);
+}
+
+const esc = (s) => String(s).replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
+
+function renderInstrumentPanel() {
+  const box = $("inst-panel");
+  if (!box) return;
+  const t = track();
+  if (!t || t.kind.type !== "instrument") {
+    box.innerHTML = `<div class="empty">Select an instrument track.</div>`;
+    return;
+  }
+
+  const sf = t.kind.soundfont;
+  const soundfonts = P.soundfonts || [];
+
+  let html = `<div style="display:flex;flex-direction:column;gap:6px;padding:4px 0">`;
+
+  // Source selection: Oscillator vs loaded SoundFonts
+  html += `<div class="row"><label style="font-size:11px;width:60px">Source</label>`;
+  html += `<select id="inst-source-sel" style="flex:1">`;
+  html += `<option value="osc" ${!sf ? "selected" : ""}>Synth (Oscillator)</option>`;
+  for (const s of soundfonts) {
+    html += `<option value="sf_${s.id}" ${sf && sf.asset === s.id ? "selected" : ""}>SF2: ${esc(s.name)}</option>`;
+  }
+  html += `</select></div>`;
+
+  if (!sf) {
+    // Waveform selection
+    html += `<div class="row"><label style="font-size:11px;width:60px">Waveform</label>`;
+    html += `<select id="inst-wf-sel" style="flex:1">`;
+    for (const wf of ["pluck", "saw", "square", "sine", "triangle"]) {
+      html += `<option value="${wf}" ${t.kind.waveform === wf ? "selected" : ""}>${wf.toUpperCase()}</option>`;
+    }
+    html += `</select></div>`;
+  } else {
+    // Preset selection for SoundFont
+    let presets = [];
+    try {
+      presets = JSON.parse(eng.soundfont_presets(sf.asset));
+    } catch (_) {}
+
+    html += `<div class="row"><label style="font-size:11px;width:60px">Preset</label>`;
+    html += `<select id="inst-preset-sel" style="flex:1">`;
+    if (presets.length === 0) {
+      html += `<option value="0:0">Bank 0 - Preset 0</option>`;
+    } else {
+      for (const p of presets) {
+        const val = `${p.bank}:${p.preset}`;
+        const isSel = sf.bank === p.bank && sf.preset === p.preset;
+        html += `<option value="${val}" ${isSel ? "selected" : ""}>${p.preset.toString().padStart(3, "0")}: ${esc(p.name)}</option>`;
+      }
+    }
+    html += `</select></div>`;
+  }
+
+  html += `<div class="btn-row" style="margin-top:2px"><button id="btn-load-sf2" style="font-size:11px">+ Load .sf2 SoundFont</button></div>`;
+  html += `</div>`;
+
+  box.innerHTML = html;
+
+  const srcSel = $("inst-source-sel");
+  if (srcSel) {
+    srcSel.onchange = (e) => {
+      const v = e.target.value;
+      if (v === "osc") {
+        apply({ cmd: "set_track_soundfont", track: t.id, soundfont: null });
+      } else if (v.startsWith("sf_")) {
+        const assetId = parseInt(v.replace("sf_", ""), 10);
+        let defaultBank = 0, defaultPreset = 0;
+        try {
+          const p = JSON.parse(eng.soundfont_presets(assetId));
+          if (p.length > 0) { defaultBank = p[0].bank; defaultPreset = p[0].preset; }
+        } catch (_) {}
+        apply({
+          cmd: "set_track_soundfont",
+          track: t.id,
+          soundfont: { asset: assetId, bank: defaultBank, preset: defaultPreset }
+        });
+      }
+      refresh();
+    };
+  }
+
+  const wfSel = $("inst-wf-sel");
+  if (wfSel) {
+    wfSel.onchange = (e) => {
+      apply({ cmd: "set_track_waveform", track: t.id, waveform: e.target.value });
+      refresh();
+    };
+  }
+
+  const preSel = $("inst-preset-sel");
+  if (preSel) {
+    preSel.onchange = (e) => {
+      const [bank, preset] = e.target.value.split(":").map((x) => parseInt(x, 10));
+      apply({
+        cmd: "set_track_soundfont",
+        track: t.id,
+        soundfont: { asset: sf.asset, bank, preset }
+      });
+      refresh();
+    };
+  }
+
+  const btnLoad = $("btn-load-sf2");
+  if (btnLoad) {
+    btnLoad.onclick = () => $("sf2-file").click();
+  }
 }
 
 function renderExpr() {
@@ -1056,6 +1168,48 @@ async function loadMidi(file) {
 }
 $("midi-file").onchange = (e) => e.target.files[0] && loadMidi(e.target.files[0]);
 
+async function importSoundfontFile(file) {
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const name = file.name.replace(/\.[^.]+$/, "");
+    const assetId = eng.import_soundfont(name, bytes);
+    let presets = [];
+    try {
+      presets = JSON.parse(eng.soundfont_presets(assetId));
+    } catch (_) {}
+    log(`Imported SoundFont "${file.name}" with ${presets.length} presets.`);
+
+    // If an instrument track is currently selected, assign this soundfont to it!
+    const curTrack = track();
+    if (curTrack && curTrack.kind.type === "instrument") {
+      const defaultPreset = presets[0] || { bank: 0, preset: 0 };
+      apply({
+        cmd: "set_track_soundfont",
+        track: curTrack.id,
+        soundfont: { asset: assetId, bank: defaultPreset.bank, preset: defaultPreset.preset }
+      });
+      log(`Assigned "${name}" (${defaultPreset.name || "Preset 0"}) to track "${curTrack.name}".`);
+    } else {
+      // Or create a new track for it
+      const trId = apply({
+        cmd: "add_track",
+        name,
+        kind: {
+          type: "instrument",
+          waveform: "pluck",
+          soundfont: { asset: assetId, bank: 0, preset: 0 }
+        }
+      }).track_id;
+      sel = trId;
+    }
+    refresh();
+  } catch (err) {
+    log("SoundFont Import Error: " + err);
+  }
+}
+$("import-soundfont").onclick = () => $("sf2-file").click();
+$("sf2-file").onchange = (e) => e.target.files[0] && importSoundfontFile(e.target.files[0]);
+
 async function importAudioFile(file) {
   try {
     ctx ??= new AudioContext({ sampleRate: eng.sample_rate() });
@@ -1079,6 +1233,7 @@ addEventListener("drop", async (e) => {
   const n = f.name.toLowerCase();
   if (/\.midi?$/.test(n)) loadMidi(f);
   else if (n.endsWith(".json")) { eng = KymionEngine.load(await f.text()); peaksCache.clear(); refresh(); log(`Loaded project "${f.name}".`); }
+  else if (n.endsWith(".sf2") || n.endsWith(".soundfont")) importSoundfontFile(f);
   else importAudioFile(f);
 });
 

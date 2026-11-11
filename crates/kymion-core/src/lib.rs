@@ -25,6 +25,8 @@ pub enum Error {
     ClipNotFound(u32),
     #[error("asset {0} not found")]
     AssetNotFound(u32),
+    #[error("soundfont {0} not found")]
+    SoundfontNotFound(u32),
     #[error("invalid argument: {0}")]
     Invalid(String),
     #[error("nothing to {0}")]
@@ -46,13 +48,40 @@ pub enum Waveform {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct SoundfontConfig {
+    pub asset: u32,
+    #[serde(default)]
+    pub bank: u16,
+    #[serde(default)]
+    pub preset: u16,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TrackKind {
-    Instrument { waveform: Waveform },
+    Instrument {
+        #[serde(default)]
+        waveform: Waveform,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        soundfont: Option<SoundfontConfig>,
+    },
     /// Singing-voice track (vocaloid-style). Notes carry lyrics.
     Vocal { voice: String },
     /// Audio track holding sampled clips placed on the timeline.
     Audio,
+}
+
+impl TrackKind {
+    pub fn instrument(waveform: Waveform) -> Self {
+        Self::Instrument { waveform, soundfont: None }
+    }
+
+    pub fn soundfont(asset: u32, bank: u16, preset: u16) -> Self {
+        Self::Instrument {
+            waveform: Waveform::Pluck,
+            soundfont: Some(SoundfontConfig { asset, bank, preset }),
+        }
+    }
 }
 
 /// Vocal expression parameters (per-track defaults, per-note override).
@@ -167,6 +196,28 @@ impl AudioAsset {
     pub fn duration_secs(&self) -> f32 {
         let n = B64.decode(&self.data).map(|b| b.len() / 2).unwrap_or(0);
         n as f32 / self.sample_rate.max(1) as f32
+    }
+}
+
+/// SoundFont 2 (.sf2) binary asset embedded in the project (base64).
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct SoundfontAsset {
+    pub id: u32,
+    pub name: String,
+    pub data: String,
+}
+
+impl SoundfontAsset {
+    pub fn from_bytes(id: u32, name: &str, bytes: &[u8]) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            data: B64.encode(bytes),
+        }
+    }
+
+    pub fn bytes(&self) -> Vec<u8> {
+        B64.decode(&self.data).unwrap_or_default()
     }
 }
 
@@ -320,6 +371,8 @@ pub struct Project {
     pub loop_region: Option<LoopRegion>,
     #[serde(default)]
     pub assets: Vec<AudioAsset>,
+    #[serde(default)]
+    pub soundfonts: Vec<SoundfontAsset>,
     next_id: u32,
 }
 fn four() -> u8 {
@@ -338,6 +391,7 @@ impl Default for Project {
             time_sig_den: 4,
             loop_region: None,
             assets: vec![],
+            soundfonts: vec![],
             next_id: 1,
         }
     }
@@ -406,6 +460,9 @@ impl Project {
         let mut p = self.clone();
         for a in &mut p.assets {
             a.data.clear();
+        }
+        for sf in &mut p.soundfonts {
+            sf.data.clear();
         }
         serde_json::to_string(&p).expect("project serialises")
     }
@@ -498,6 +555,12 @@ pub enum Command {
     SetFx { track: Option<u32>, fx: u32, kind: Option<FxKind>, enabled: Option<bool> },
     /// Remove an effect from an FX chain.
     RemoveFx { track: Option<u32>, fx: u32 },
+    /// Add a SoundFont 2 binary asset (base64-encoded).
+    AddSoundfont { name: String, data: String },
+    /// Configure SoundFont instrument on an instrument track.
+    SetTrackSoundfont { track: u32, soundfont: Option<SoundfontConfig> },
+    /// Set oscillator waveform on an instrument track.
+    SetTrackWaveform { track: u32, waveform: Waveform },
 }
 fn vel() -> u8 {
     100
@@ -563,6 +626,15 @@ impl Engine {
         self.redo.clear();
         let id = self.project.alloc();
         self.project.assets.push(AudioAsset::from_samples(id, name, sample_rate, samples));
+        id
+    }
+
+    /// Embed SoundFont 2 (.sf2) binary as a project asset (undoable). Returns the asset id.
+    pub fn import_soundfont(&mut self, name: &str, bytes: &[u8]) -> u32 {
+        self.undo.push(self.project.clone());
+        self.redo.clear();
+        let id = self.project.alloc();
+        self.project.soundfonts.push(SoundfontAsset::from_bytes(id, name, bytes));
         id
     }
 
@@ -929,6 +1001,32 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
                 return Err(Error::FxNotFound(fx));
             }
         }
+        Command::AddSoundfont { name, data } => {
+            let id = p.alloc();
+            p.soundfonts.push(SoundfontAsset { id, name, data });
+            out.asset_id = Some(id);
+        }
+        Command::SetTrackSoundfont { track, soundfont } => {
+            if let Some(ref sf) = soundfont {
+                if !p.soundfonts.iter().any(|s| s.id == sf.asset) {
+                    return Err(Error::SoundfontNotFound(sf.asset));
+                }
+            }
+            let t = p.track_mut(track)?;
+            match &mut t.kind {
+                TrackKind::Instrument { soundfont: sf_slot, .. } => {
+                    *sf_slot = soundfont;
+                }
+                _ => return Err(Error::Invalid("track is not an instrument track".into())),
+            }
+        }
+        Command::SetTrackWaveform { track, waveform } => {
+            let t = p.track_mut(track)?;
+            match &mut t.kind {
+                TrackKind::Instrument { waveform: wf, .. } => *wf = waveform,
+                _ => return Err(Error::Invalid("track is not an instrument track".into())),
+            }
+        }
     }
     Ok(out)
 }
@@ -968,7 +1066,7 @@ mod tests {
     #[test]
     fn batch_note_ops_and_split() {
         let mut e = Engine::default();
-        let t = e.apply(Command::AddTrack { name: "k".into(), kind: TrackKind::Instrument { waveform: Waveform::Sine } }).unwrap().track_id.unwrap();
+        let t = e.apply(Command::AddTrack { name: "k".into(), kind: TrackKind::instrument(Waveform::Sine) }).unwrap().track_id.unwrap();
         let ids = e
             .apply(Command::AddNotes {
                 track: t,
@@ -1016,7 +1114,7 @@ mod tests {
         let t = e
             .apply(Command::AddTrack {
                 name: "Synth".into(),
-                kind: TrackKind::Instrument { waveform: Waveform::Saw },
+                kind: TrackKind::instrument(Waveform::Saw),
             })
             .unwrap()
             .track_id
@@ -1086,5 +1184,67 @@ mod tests {
         assert_eq!(e.project.tracks[0].clips[1].fade_in_ticks, 0);
         e.redo().unwrap();
         assert_eq!(e.project.tracks[0].clips[1].fade_in_ticks, 120);
+    }
+
+    #[test]
+    fn soundfont_asset_and_commands() {
+        let mut e = Engine::default();
+        let sf_id = e.import_soundfont("TestSF2", b"RIFFfakeSF2");
+        assert_eq!(e.project.soundfonts.len(), 1);
+        assert_eq!(e.project.soundfonts[0].name, "TestSF2");
+
+        let t = e
+            .apply(Command::AddTrack {
+                name: "Piano".into(),
+                kind: TrackKind::instrument(Waveform::Sine),
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
+
+        // Assign soundfont preset 0
+        e.apply(Command::SetTrackSoundfont {
+            track: t,
+            soundfont: Some(SoundfontConfig {
+                asset: sf_id,
+                bank: 0,
+                preset: 0,
+            }),
+        })
+        .unwrap();
+
+        match &e.project.tracks[0].kind {
+            TrackKind::Instrument { soundfont: Some(sf), .. } => {
+                assert_eq!(sf.asset, sf_id);
+                assert_eq!(sf.preset, 0);
+            }
+            _ => panic!("Expected soundfont instrument"),
+        }
+
+        // Change waveform
+        e.apply(Command::SetTrackWaveform {
+            track: t,
+            waveform: Waveform::Square,
+        })
+        .unwrap();
+
+        match &e.project.tracks[0].kind {
+            TrackKind::Instrument { waveform, .. } => {
+                assert_eq!(*waveform, Waveform::Square);
+            }
+            _ => panic!("Expected instrument track"),
+        }
+
+        // Non-existent soundfont should fail
+        assert!(e
+            .apply(Command::SetTrackSoundfont {
+                track: t,
+                soundfont: Some(SoundfontConfig {
+                    asset: 9999,
+                    bank: 0,
+                    preset: 0,
+                }),
+            })
+            .is_err());
     }
 }

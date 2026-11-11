@@ -11,5 +11,6 @@ kymion-core.workspace = true
 kymion-dsp.workspace = true
 kymion-vocal.workspace = true
 hound.workspace = true
+rustysynth.workspace = true
 serde.workspace = true
 thiserror.workspace = true

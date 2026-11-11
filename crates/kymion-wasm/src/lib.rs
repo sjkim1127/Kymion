@@ -80,6 +80,21 @@ impl KymionEngine {
         self.cache = None;
         id
     }
+    /// Import SoundFont 2 (.sf2) binary bytes as a soundfont asset; returns the asset id.
+    pub fn import_soundfont(&mut self, name: &str, bytes: &[u8]) -> u32 {
+        let id = self.inner.import_soundfont(name, bytes);
+        self.cache = None;
+        id
+    }
+    /// Return JSON array of presets available in an imported SoundFont asset: [{"bank":0,"preset":0,"name":"..."}]
+    pub fn soundfont_presets(&self, asset: u32) -> String {
+        let Some(sf) = self.inner.project.soundfonts.iter().find(|s| s.id == asset) else {
+            return "[]".to_string();
+        };
+        let bytes = sf.bytes();
+        let list = kymion_audio::list_soundfont_presets(&bytes);
+        serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string())
+    }
     /// Peak envelope (max |sample| per bucket) of an asset for waveform drawing.
     pub fn asset_peaks(&self, asset: u32, buckets: u32) -> Vec<f32> {
         let Some(a) = self.inner.project.assets.iter().find(|a| a.id == asset) else { return vec![] };
