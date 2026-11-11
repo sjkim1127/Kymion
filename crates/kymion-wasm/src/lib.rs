@@ -1,8 +1,6 @@
 //! WASM bindings: the same Engine the CLI uses, driven from the browser GUI.
 
-use kymion_audio::{
-    analyze, interleave, render_full, to_wav_bytes, FullRender, RenderOptions,
-};
+use kymion_audio::{analyze, interleave, render_full, to_wav_bytes, FullRender, RenderOptions};
 use kymion_core::{
     command_schema,
     midi::{export_midi, import_midi},
@@ -97,7 +95,9 @@ impl KymionEngine {
     }
     /// Peak envelope (max |sample| per bucket) of an asset for waveform drawing.
     pub fn asset_peaks(&self, asset: u32, buckets: u32) -> Vec<f32> {
-        let Some(a) = self.inner.project.assets.iter().find(|a| a.id == asset) else { return vec![] };
+        let Some(a) = self.inner.project.assets.iter().find(|a| a.id == asset) else {
+            return vec![];
+        };
         let data = a.samples();
         let n = buckets.max(1) as usize;
         let step = (data.len() / n).max(1);
@@ -135,14 +135,22 @@ impl KymionEngine {
 
     fn ensure_render(&mut self, metronome: bool) {
         if self.cache.is_none() || self.cache_metro != metronome {
-            self.cache = Some(render_full(&self.inner.project, &RenderOptions { metronome }));
+            self.cache = Some(render_full(
+                &self.inner.project,
+                &RenderOptions { metronome },
+            ));
             self.cache_metro = metronome;
         }
     }
 
     /// Render a slice of interleaved stereo audio starting at `start_sample` for `num_samples`,
     /// wrapping seamlessly if a loop region is set.
-    pub fn render_slice(&mut self, start_sample: u32, num_samples: u32, metronome: bool) -> Vec<f32> {
+    pub fn render_slice(
+        &mut self,
+        start_sample: u32,
+        num_samples: u32,
+        metronome: bool,
+    ) -> Vec<f32> {
         self.ensure_render(metronome);
         let full = self.cache.as_ref().unwrap();
         let ml = &full.master.left;
@@ -182,7 +190,11 @@ impl KymionEngine {
     /// Calculate RMS and peak meters for master and all tracks at the given sample slice.
     pub fn meter_levels(&mut self, start_sample: u32, num_samples: u32) -> String {
         self.ensure_render(false);
-        let m = self.cache.as_ref().unwrap().meters_at(start_sample as usize, num_samples as usize);
+        let m = self
+            .cache
+            .as_ref()
+            .unwrap()
+            .meters_at(start_sample as usize, num_samples as usize);
         serde_json::to_string(&m).unwrap_or_else(|_| "{}".into())
     }
 }

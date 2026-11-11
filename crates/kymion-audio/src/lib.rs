@@ -1,6 +1,8 @@
 //! Kymion audio engine: offline renderer, mixer, DSP effects chain, analysis, WAV export.
 
-use kymion_core::{eval_auto, FxInstance, FxKind, Project, SoundfontConfig, Track, TrackKind, Waveform, PPQ};
+use kymion_core::{
+    eval_auto, FxInstance, FxKind, Project, SoundfontConfig, Track, TrackKind, Waveform, PPQ,
+};
 use kymion_dsp::{midi_to_hz, Adsr, Compressor, Eq3Band, Osc, StereoDelay, StereoReverb};
 use kymion_vocal::{render_track as render_vocal, FormantVoice};
 use serde::Serialize;
@@ -118,10 +120,21 @@ fn render_soundfont_into(
         let on = (p.ticks_to_secs(n.start) * srf) as usize;
         let off = (p.ticks_to_secs(n.start + n.duration) * srf) as usize;
         if on < total_samples {
-            events.push((on, MidiEvt::NoteOn { key: n.pitch as i32, vel: n.velocity as i32 }));
+            events.push((
+                on,
+                MidiEvt::NoteOn {
+                    key: n.pitch as i32,
+                    vel: n.velocity as i32,
+                },
+            ));
         }
         if off < total_samples {
-            events.push((off, MidiEvt::NoteOff { key: n.pitch as i32 }));
+            events.push((
+                off,
+                MidiEvt::NoteOff {
+                    key: n.pitch as i32,
+                },
+            ));
         }
     }
     events.sort_by(|a, b| {
@@ -175,8 +188,10 @@ pub fn apply_fx_chain(left: &mut [f32], right: &mut [f32], fx_list: &[FxInstance
                 mid_q,
                 high_gain,
             } => {
-                let mut eq_l = Eq3Band::new(*low_gain, *mid_gain, *mid_freq, *mid_q, *high_gain, srf);
-                let mut eq_r = Eq3Band::new(*low_gain, *mid_gain, *mid_freq, *mid_q, *high_gain, srf);
+                let mut eq_l =
+                    Eq3Band::new(*low_gain, *mid_gain, *mid_freq, *mid_q, *high_gain, srf);
+                let mut eq_r =
+                    Eq3Band::new(*low_gain, *mid_gain, *mid_freq, *mid_q, *high_gain, srf);
                 for (l, r) in left.iter_mut().zip(right.iter_mut()) {
                     *l = eq_l.process(*l);
                     *r = eq_r.process(*r);
@@ -215,7 +230,14 @@ pub fn apply_fx_chain(left: &mut [f32], right: &mut [f32], fx_list: &[FxInstance
                 release_ms,
                 makeup_db,
             } => {
-                let mut comp = Compressor::new(*threshold_db, *ratio, *attack_ms, *release_ms, *makeup_db, srf);
+                let mut comp = Compressor::new(
+                    *threshold_db,
+                    *ratio,
+                    *attack_ms,
+                    *release_ms,
+                    *makeup_db,
+                    srf,
+                );
                 for (l, r) in left.iter_mut().zip(right.iter_mut()) {
                     let (out_l, out_r) = comp.process(*l, *r);
                     *l = out_l;
@@ -236,7 +258,9 @@ pub struct RenderOptions {
 /// respecting clip start, asset offset (start trim), duration (end trim), gain, and fades.
 fn render_audio_track_into(p: &Project, t: &Track, sr: u32, buf: &mut [f32]) {
     for clip in &t.clips {
-        let Some(asset) = p.assets.iter().find(|a| a.id == clip.asset) else { continue };
+        let Some(asset) = p.assets.iter().find(|a| a.id == clip.asset) else {
+            continue;
+        };
         let data = asset.samples();
         if data.is_empty() {
             continue;
@@ -290,7 +314,7 @@ fn add_metronome(p: &Project, l: &mut [f32], r: &mut [f32], sr: u32) {
         if start >= l.len() || tick > p.length_ticks() + p.bar_ticks() {
             break;
         }
-        let down = b % p.time_sig_num.max(1) as u32 == 0;
+        let down = b.is_multiple_of(p.time_sig_num.max(1) as u32);
         let hz = if down { 1500.0 } else { 1000.0 };
         for i in 0..blip {
             let env = (-(i as f32) / (0.01 * srf)).exp();
@@ -334,7 +358,7 @@ pub struct TrackMeterEnvelope {
 impl TrackMeterEnvelope {
     pub fn from_audio(id: u32, left: &[f32], right: &[f32]) -> Self {
         let n = left.len().min(right.len());
-        let num_blocks = (n + METER_BLOCK_SIZE - 1) / METER_BLOCK_SIZE;
+        let num_blocks = n.div_ceil(METER_BLOCK_SIZE);
         let mut peaks = Vec::with_capacity(num_blocks);
         let mut rms = Vec::with_capacity(num_blocks);
 
@@ -360,7 +384,9 @@ impl TrackMeterEnvelope {
     #[inline]
     pub fn meter_at(&self, start: usize, len: usize) -> Meter {
         let start_blk = start / METER_BLOCK_SIZE;
-        let end_blk = ((start + len + METER_BLOCK_SIZE - 1) / METER_BLOCK_SIZE).min(self.peaks.len());
+        let end_blk = (start + len)
+            .div_ceil(METER_BLOCK_SIZE)
+            .min(self.peaks.len());
         if start_blk >= self.peaks.len() || start_blk >= end_blk {
             return Meter::default();
         }
@@ -414,7 +440,10 @@ impl FullRender {
             tracks.insert(t.id, t.meter_at(start, len));
         }
         ProjectMeters {
-            master: StereoMeter { left: ml, right: mr },
+            master: StereoMeter {
+                left: ml,
+                right: mr,
+            },
             tracks,
         }
     }
@@ -454,7 +483,10 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
         let mut is_stereo = false;
 
         match &t.kind {
-            TrackKind::Instrument { waveform, soundfont } => {
+            TrackKind::Instrument {
+                waveform,
+                soundfont,
+            } => {
                 if let Some(sf_cfg) = soundfont {
                     render_soundfont_into(p, t, sf_cfg, sr, &mut trk_l, &mut trk_r);
                     is_stereo = true;
@@ -532,24 +564,36 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
     }
 
     FullRender {
-        master: Stereo { sample_rate: sr, left: master_l, right: master_r },
+        master: Stereo {
+            sample_rate: sr,
+            left: master_l,
+            right: master_r,
+        },
         track_meters,
     }
 }
 
 /// Decode WAV bytes (8/16/24/32-bit int or 32-bit float) to mono f32 + sample rate.
 pub fn decode_wav(bytes: &[u8]) -> Result<(u32, Vec<f32>), String> {
-    let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
+    let mut reader =
+        hound::WavReader::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
     let spec = reader.spec();
     let ch = spec.channels.max(1) as usize;
     let raw: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Float => reader.samples::<f32>().filter_map(Result::ok).collect(),
         hound::SampleFormat::Int => {
             let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
-            reader.samples::<i32>().filter_map(Result::ok).map(|v| v as f32 / max).collect()
+            reader
+                .samples::<i32>()
+                .filter_map(Result::ok)
+                .map(|v| v as f32 / max)
+                .collect()
         }
     };
-    let mono = raw.chunks(ch).map(|f| f.iter().sum::<f32>() / ch as f32).collect();
+    let mono = raw
+        .chunks(ch)
+        .map(|f| f.iter().sum::<f32>() / ch as f32)
+        .collect();
     Ok((spec.sample_rate, mono))
 }
 
@@ -583,8 +627,10 @@ pub fn to_wav_bytes(s: &Stereo) -> Vec<u8> {
     {
         let mut w = hound::WavWriter::new(&mut cur, spec).unwrap();
         for (a, b) in s.left.iter().zip(&s.right) {
-            w.write_sample((a.clamp(-1.0, 1.0) * 32767.0) as i16).unwrap();
-            w.write_sample((b.clamp(-1.0, 1.0) * 32767.0) as i16).unwrap();
+            w.write_sample((a.clamp(-1.0, 1.0) * 32767.0) as i16)
+                .unwrap();
+            w.write_sample((b.clamp(-1.0, 1.0) * 32767.0) as i16)
+                .unwrap();
         }
         w.finalize().unwrap();
     }
@@ -651,14 +697,51 @@ mod tests {
         let mut e = Engine::default();
         let tone: Vec<f32> = (0..44100).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
         let asset = e.import_audio("tone", 44100, &tone);
-        let a = e.apply(Command::AddTrack { name: "audio".into(), kind: TrackKind::Audio }).unwrap().track_id.unwrap();
-        e.apply(Command::AddClip { track: a, asset, start: 0, gain: None, offset_ticks: None, duration_ticks: None }).unwrap();
-        let i = e.apply(Command::AddTrack { name: "inst".into(), kind: TrackKind::instrument(Waveform::Sine) }).unwrap().track_id.unwrap();
-        e.apply(Command::AddNote { track: i, start: 0, duration: 480, pitch: 60, velocity: 100, lyric: None }).unwrap();
+        let a = e
+            .apply(Command::AddTrack {
+                name: "audio".into(),
+                kind: TrackKind::Audio,
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
+        e.apply(Command::AddClip {
+            track: a,
+            asset,
+            start: 0,
+            gain: None,
+            offset_ticks: None,
+            duration_ticks: None,
+        })
+        .unwrap();
+        let i = e
+            .apply(Command::AddTrack {
+                name: "inst".into(),
+                kind: TrackKind::instrument(Waveform::Sine),
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
+        e.apply(Command::AddNote {
+            track: i,
+            start: 0,
+            duration: 480,
+            pitch: 60,
+            velocity: 100,
+            lyric: None,
+        })
+        .unwrap();
 
         let both = analyze(&render(&e.project)).rms;
         // soloing the instrument must silence the audio clip (lower energy than both)
-        e.apply(Command::SetMix { track: i, gain: None, pan: None, mute: None, solo: Some(true) }).unwrap();
+        e.apply(Command::SetMix {
+            track: i,
+            gain: None,
+            pan: None,
+            mute: None,
+            solo: Some(true),
+        })
+        .unwrap();
         let solo = analyze(&render(&e.project)).rms;
         assert!(solo < both, "solo={solo} both={both}");
 
@@ -668,13 +751,23 @@ mod tests {
         assert!(click > plain);
 
         // gain automation to zero silences the track
-        e.apply(Command::AddAutoPoint { track: i, param: kymion_core::AutoParam::Gain, tick: 0, value: 0.0 }).unwrap();
+        e.apply(Command::AddAutoPoint {
+            track: i,
+            param: kymion_core::AutoParam::Gain,
+            tick: 0,
+            value: 0.0,
+        })
+        .unwrap();
         assert!(analyze(&render(&e.project)).peak < 1e-6);
     }
 
     #[test]
     fn wav_roundtrip() {
-        let s = Stereo { sample_rate: 22050, left: vec![0.5; 100], right: vec![0.5; 100] };
+        let s = Stereo {
+            sample_rate: 22050,
+            left: vec![0.5; 100],
+            right: vec![0.5; 100],
+        };
         let (sr, mono) = decode_wav(&to_wav_bytes(&s)).unwrap();
         assert_eq!(sr, 22050);
         assert_eq!(mono.len(), 100);
@@ -686,18 +779,35 @@ mod tests {
         let mut e = Engine::default();
         let samples = vec![1.0f32; 44100]; // 1 second DC = 1.0
         let asset = e.import_audio("dc", 44100, &samples);
-        let tr = e.apply(Command::AddTrack { name: "A".into(), kind: TrackKind::Audio }).unwrap().track_id.unwrap();
-        let cl = e.apply(Command::AddClip {
-            track: tr,
-            asset,
-            start: 0,
-            gain: Some(1.0),
-            offset_ticks: None,
-            duration_ticks: None,
-        }).unwrap().clip_id.unwrap();
+        let tr = e
+            .apply(Command::AddTrack {
+                name: "A".into(),
+                kind: TrackKind::Audio,
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
+        let cl = e
+            .apply(Command::AddClip {
+                track: tr,
+                asset,
+                start: 0,
+                gain: Some(1.0),
+                offset_ticks: None,
+                duration_ticks: None,
+            })
+            .unwrap()
+            .clip_id
+            .unwrap();
 
         // Apply fade in (half second = 480 ticks) and fade out (480 ticks)
-        e.apply(Command::SetClipFade { track: tr, clip: cl, fade_in_ticks: Some(480), fade_out_ticks: Some(480) }).unwrap();
+        e.apply(Command::SetClipFade {
+            track: tr,
+            clip: cl,
+            fade_in_ticks: Some(480),
+            fade_out_ticks: Some(480),
+        })
+        .unwrap();
 
         let full = render_full(&e.project, &RenderOptions::default());
         assert_eq!(full.track_meters.len(), 1);

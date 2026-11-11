@@ -2,8 +2,8 @@
 
 use crate::{Error, Note, Project, Result, Track, TrackKind, Waveform, PPQ};
 use midly::{
-    Format, Header, MetaMessage, MidiMessage, num::{u4, u7, u24, u28},
-    Smf, Timing, TrackEvent, TrackEventKind,
+    num::{u24, u28, u4, u7},
+    Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind,
 };
 use std::collections::HashMap;
 
@@ -69,7 +69,8 @@ pub fn import_midi(bytes: &[u8]) -> Result<Project> {
                         }
                     }
                 }
-                TrackEventKind::Meta(MetaMessage::Lyric(l_bytes)) | TrackEventKind::Meta(MetaMessage::Text(l_bytes)) => {
+                TrackEventKind::Meta(MetaMessage::Lyric(l_bytes))
+                | TrackEventKind::Meta(MetaMessage::Text(l_bytes)) => {
                     if let Ok(s) = std::str::from_utf8(l_bytes) {
                         let trimmed = s.trim();
                         if !trimmed.is_empty() {
@@ -141,20 +142,26 @@ pub fn import_midi(bytes: &[u8]) -> Result<Project> {
         notes.sort_by_key(|n| (n.start, n.pitch));
 
         // Assign note IDs and attach lyrics
-        let mut next_note_id = 1u32;
-        for n in &mut notes {
+        for (next_note_id, n) in (1u32..).zip(notes.iter_mut()) {
             n.id = next_note_id;
-            next_note_id += 1;
 
             // Find closest lyric within 120 ticks
-            if let Some((&lyric_tick, lyric_str)) = lyrics.iter().find(|(&lt, _)| (lt as i64 - n.start as i64).abs() <= 120) {
+            if let Some((&lyric_tick, lyric_str)) = lyrics
+                .iter()
+                .find(|(&lt, _)| (lt as i64 - n.start as i64).abs() <= 120)
+            {
                 n.lyric = Some(lyric_str.clone());
                 lyrics.remove(&lyric_tick);
             }
         }
 
-        let kind = if is_vocal || track_name.to_lowercase().contains("vocal") || track_name.to_lowercase().contains("voice") {
-            TrackKind::Vocal { voice: "default".into() }
+        let kind = if is_vocal
+            || track_name.to_lowercase().contains("vocal")
+            || track_name.to_lowercase().contains("voice")
+        {
+            TrackKind::Vocal {
+                voice: "default".into(),
+            }
         } else {
             TrackKind::instrument(Waveform::Pluck)
         };
@@ -175,7 +182,10 @@ pub fn import_midi(bytes: &[u8]) -> Result<Project> {
 
 /// Export a Kymion Project to Standard MIDI File (.mid) bytes.
 pub fn export_midi(project: &Project) -> Result<Vec<u8>> {
-    let header = Header::new(Format::Parallel, Timing::Metrical(midly::num::u15::from(PPQ as u16)));
+    let header = Header::new(
+        Format::Parallel,
+        Timing::Metrical(midly::num::u15::from(PPQ as u16)),
+    );
     let mut smf = Smf::new(header);
 
     // Tempo track (Track 0)
@@ -186,13 +196,19 @@ pub fn export_midi(project: &Project) -> Result<Vec<u8>> {
     };
     let time_sig_event = TrackEvent {
         delta: u28::from(0u32),
-        kind: TrackEventKind::Meta(MetaMessage::TimeSignature(project.time_sig_num, project.time_sig_den.max(1).trailing_zeros() as u8, 24, 8)),
+        kind: TrackEventKind::Meta(MetaMessage::TimeSignature(
+            project.time_sig_num,
+            project.time_sig_den.max(1).trailing_zeros() as u8,
+            24,
+            8,
+        )),
     };
     let end_event = TrackEvent {
         delta: u28::from(0u32),
         kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
     };
-    smf.tracks.push(vec![tempo_event, time_sig_event, end_event]);
+    smf.tracks
+        .push(vec![tempo_event, time_sig_event, end_event]);
 
     // Data tracks
     for (t_idx, track) in project.tracks.iter().enumerate() {
@@ -200,7 +216,10 @@ pub fn export_midi(project: &Project) -> Result<Vec<u8>> {
         let mut events: Vec<(u32, TrackEventKind)> = Vec::new();
 
         // Track Name
-        events.push((0, TrackEventKind::Meta(MetaMessage::TrackName(track.name.as_bytes()))));
+        events.push((
+            0,
+            TrackEventKind::Meta(MetaMessage::TrackName(track.name.as_bytes())),
+        ));
 
         for note in &track.notes {
             let key = u7::from(note.pitch.min(127));
@@ -208,7 +227,10 @@ pub fn export_midi(project: &Project) -> Result<Vec<u8>> {
 
             // Optional lyric
             if let Some(l) = &note.lyric {
-                events.push((note.start, TrackEventKind::Meta(MetaMessage::Lyric(l.as_bytes()))));
+                events.push((
+                    note.start,
+                    TrackEventKind::Meta(MetaMessage::Lyric(l.as_bytes())),
+                ));
             }
 
             // Note On
@@ -225,7 +247,10 @@ pub fn export_midi(project: &Project) -> Result<Vec<u8>> {
                 note.start + note.duration,
                 TrackEventKind::Midi {
                     channel,
-                    message: MidiMessage::NoteOff { key, vel: u7::from(0u8) },
+                    message: MidiMessage::NoteOff {
+                        key,
+                        vel: u7::from(0u8),
+                    },
                 },
             ));
         }
@@ -233,8 +258,20 @@ pub fn export_midi(project: &Project) -> Result<Vec<u8>> {
         // Sort events chronologically (NoteOff before NoteOn if simultaneous)
         events.sort_by(|a, b| {
             a.0.cmp(&b.0).then_with(|| match (&a.1, &b.1) {
-                (TrackEventKind::Midi { message: MidiMessage::NoteOff { .. }, .. }, _) => std::cmp::Ordering::Less,
-                (_, TrackEventKind::Midi { message: MidiMessage::NoteOff { .. }, .. }) => std::cmp::Ordering::Greater,
+                (
+                    TrackEventKind::Midi {
+                        message: MidiMessage::NoteOff { .. },
+                        ..
+                    },
+                    _,
+                ) => std::cmp::Ordering::Less,
+                (
+                    _,
+                    TrackEventKind::Midi {
+                        message: MidiMessage::NoteOff { .. },
+                        ..
+                    },
+                ) => std::cmp::Ordering::Greater,
                 _ => std::cmp::Ordering::Equal,
             })
         });
@@ -257,7 +294,8 @@ pub fn export_midi(project: &Project) -> Result<Vec<u8>> {
     }
 
     let mut buf = Vec::new();
-    smf.write(&mut buf).map_err(|e| Error::Invalid(format!("MIDI export error: {e}")))?;
+    smf.write(&mut buf)
+        .map_err(|e| Error::Invalid(format!("MIDI export error: {e}")))?;
     Ok(buf)
 }
 
@@ -269,10 +307,32 @@ mod tests {
     fn midi_roundtrip() {
         let mut p = Project::new("MIDI Test");
         p.tempo = 140.0;
-        let mut t = Track::new(1, "Lead", TrackKind::Vocal { voice: "default".into() });
+        let mut t = Track::new(
+            1,
+            "Lead",
+            TrackKind::Vocal {
+                voice: "default".into(),
+            },
+        );
         t.notes = vec![
-            Note { id: 1, start: 0, duration: 480, pitch: 60, velocity: 100, lyric: Some("Do".into()), expression: None },
-            Note { id: 2, start: 480, duration: 480, pitch: 62, velocity: 110, lyric: Some("Re".into()), expression: None },
+            Note {
+                id: 1,
+                start: 0,
+                duration: 480,
+                pitch: 60,
+                velocity: 100,
+                lyric: Some("Do".into()),
+                expression: None,
+            },
+            Note {
+                id: 2,
+                start: 480,
+                duration: 480,
+                pitch: 62,
+                velocity: 110,
+                lyric: Some("Re".into()),
+                expression: None,
+            },
         ];
         p.tracks.push(t);
 

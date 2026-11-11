@@ -8,13 +8,28 @@ use kymion_core::{Expression, Note, Project, Track};
 use kymion_dsp::{midi_to_hz, Adsr, Biquad, Noise, Osc};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Vowel { A, E, I, O, U, Eu }
+pub enum Vowel {
+    A,
+    E,
+    I,
+    O,
+    U,
+    Eu,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Onset { None, Stop, Fricative, Nasal }
+pub enum Onset {
+    None,
+    Stop,
+    Fricative,
+    Nasal,
+}
 
 #[derive(Clone, Copy, Debug)]
-pub struct Phoneme { pub onset: Onset, pub vowel: Vowel }
+pub struct Phoneme {
+    pub onset: Onset,
+    pub vowel: Vowel,
+}
 
 impl Vowel {
     /// Approximate F1/F2/F3 (Hz) for a neutral adult voice.
@@ -38,8 +53,8 @@ pub fn lyric_to_phoneme(lyric: &str) -> Phoneme {
             let idx = u - 0xAC00;
             let (cho, jung) = (idx / 588, (idx % 588) / 28);
             let vowel = match jung {
-                0 | 1 | 2 | 3 | 9 | 10 => Vowel::A,
-                4 | 5 | 6 | 7 => Vowel::E,
+                0..=3 | 9 | 10 => Vowel::A,
+                4..=7 => Vowel::E,
                 8 | 11 | 12 => Vowel::O,
                 13 | 14 | 15 | 17 => Vowel::U,
                 16 | 20 => Vowel::I,
@@ -53,12 +68,31 @@ pub fn lyric_to_phoneme(lyric: &str) -> Phoneme {
             };
             return Phoneme { onset, vowel };
         }
-        let k = if (0x30A1..=0x30F6).contains(&u) { char::from_u32(u - 0x60).unwrap() } else { c };
+        let k = if (0x30A1..=0x30F6).contains(&u) {
+            char::from_u32(u - 0x60).unwrap()
+        } else {
+            c
+        };
         if let Some(v) = kana_vowel(k) {
-            let onset = if "あいうえお".contains(k) { Onset::None } else if "なにぬねのまみむめも".contains(k) { Onset::Nasal } else if "さしすせそはひふへほざじずぜぞ".contains(k) { Onset::Fricative } else { Onset::Stop };
+            let onset = if "あいうえお".contains(k) {
+                Onset::None
+            } else if "なにぬねのまみむめも".contains(k) {
+                Onset::Nasal
+            } else if "さしすせそはひふへほざじずぜぞ".contains(k) {
+                Onset::Fricative
+            } else {
+                Onset::Stop
+            };
             return Phoneme { onset, vowel: v };
         }
-        if let Some(v) = match c.to_ascii_lowercase() { 'a' => Some(Vowel::A), 'e' => Some(Vowel::E), 'i' => Some(Vowel::I), 'o' => Some(Vowel::O), 'u' => Some(Vowel::U), _ => None } {
+        if let Some(v) = match c.to_ascii_lowercase() {
+            'a' => Some(Vowel::A),
+            'e' => Some(Vowel::E),
+            'i' => Some(Vowel::I),
+            'o' => Some(Vowel::O),
+            'u' => Some(Vowel::U),
+            _ => None,
+        } {
             let onset = match lyric.chars().next().map(|x| x.to_ascii_lowercase()) {
                 Some(x) if "aeiou".contains(x) => Onset::None,
                 Some(x) if "mn".contains(x) => Onset::Nasal,
@@ -68,7 +102,10 @@ pub fn lyric_to_phoneme(lyric: &str) -> Phoneme {
             return Phoneme { onset, vowel: v };
         }
     }
-    Phoneme { onset: Onset::None, vowel: Vowel::A }
+    Phoneme {
+        onset: Onset::None,
+        vowel: Vowel::A,
+    }
 }
 
 fn kana_vowel(c: char) -> Option<Vowel> {
@@ -109,7 +146,9 @@ impl Voice for FormantVoice {
         let shift = 2f32.powf(r.expr.formant_shift / 12.0);
         let f = r.phoneme.vowel.formants();
         let bw = [80.0, 100.0, 140.0];
-        let mut filters: Vec<Biquad> = (0..3).map(|i| Biquad::bandpass(f[i] * shift, f[i] * shift / bw[i], srf)).collect();
+        let mut filters: Vec<Biquad> = (0..3)
+            .map(|i| Biquad::bandpass(f[i] * shift, f[i] * shift / bw[i], srf))
+            .collect();
         let gains = [1.0, 0.6, 0.3];
         let mut osc = Osc::default();
         let mut noise = Noise::new(0x9E3779B9);
@@ -117,23 +156,36 @@ impl Voice for FormantVoice {
         let mut env = Adsr::new(0.015, 0.05, 0.85, rel, srf);
         let mut vib_phase = 0f32;
         let (onset_len, onset_gain) = match r.phoneme.onset {
-            Onset::None => (0.0, 0.0), Onset::Stop => (0.012, 0.6), Onset::Fricative => (0.045, 0.5), Onset::Nasal => (0.03, 0.0),
+            Onset::None => (0.0, 0.0),
+            Onset::Stop => (0.012, 0.6),
+            Onset::Fricative => (0.045, 0.5),
+            Onset::Nasal => (0.03, 0.0),
         };
         for i in 0..n {
             let t = i as f32 / srf;
-            if t >= r.seconds { env.gate_off(); }
+            if t >= r.seconds {
+                env.gate_off();
+            }
             // pitch: portamento glide + delayed vibrato
-            let glide = if r.expr.portamento > 0.0 { (t / r.expr.portamento).min(1.0) } else { 1.0 };
+            let glide = if r.expr.portamento > 0.0 {
+                (t / r.expr.portamento).min(1.0)
+            } else {
+                1.0
+            };
             let mut pitch = r.from_pitch + (r.pitch - r.from_pitch) * glide;
             if t > r.expr.vibrato_delay {
                 let fade = ((t - r.expr.vibrato_delay) / 0.2).min(1.0);
                 vib_phase += r.expr.vibrato_rate / srf;
-                pitch += (vib_phase * std::f32::consts::TAU).sin() * r.expr.vibrato_depth / 100.0 * fade;
+                pitch +=
+                    (vib_phase * std::f32::consts::TAU).sin() * r.expr.vibrato_depth / 100.0 * fade;
             }
             let hz = midi_to_hz(pitch);
-            let src = osc.glottal(hz, srf) * (1.0 - r.expr.breath) + noise.next() * r.expr.breath * 0.5;
+            let src =
+                osc.glottal(hz, srf) * (1.0 - r.expr.breath) + noise.next() * r.expr.breath * 0.5;
             let mut v = 0.0;
-            for (b, g) in filters.iter_mut().zip(gains) { v += b.process(src) * g; }
+            for (b, g) in filters.iter_mut().zip(gains) {
+                v += b.process(src) * g;
+            }
             v *= 2.5;
             if t < onset_len {
                 let k = 1.0 - t / onset_len;
@@ -147,11 +199,15 @@ impl Voice for FormantVoice {
 
 /// Render a vocal track to mono samples at `sr`.
 pub fn render_track(project: &Project, track: &Track, voice: &dyn Voice, sr: u32) -> Vec<f32> {
-    let total = (project.ticks_to_secs(project.length_ticks()) * sr as f32) as usize + sr as usize / 2;
+    let total =
+        (project.ticks_to_secs(project.length_ticks()) * sr as f32) as usize + sr as usize / 2;
     let mut buf = vec![0f32; total];
     let mut prev: Option<(&Note, u32)> = None;
     for note in &track.notes {
-        let expr = note.expression.clone().unwrap_or_else(|| track.expression.clone());
+        let expr = note
+            .expression
+            .clone()
+            .unwrap_or_else(|| track.expression.clone());
         let from = match prev {
             Some((p, end)) if note.start <= end + 60 => p.pitch as f32,
             _ => note.pitch as f32,
@@ -167,7 +223,9 @@ pub fn render_track(project: &Project, track: &Track, voice: &dyn Voice, sr: u32
         let samples = voice.render_note(&req, sr);
         let off = (project.ticks_to_secs(note.start) * sr as f32) as usize;
         for (i, s) in samples.iter().enumerate() {
-            if let Some(b) = buf.get_mut(off + i) { *b += s; }
+            if let Some(b) = buf.get_mut(off + i) {
+                *b += s;
+            }
         }
         prev = Some((note, note.start + note.duration));
     }

@@ -4,13 +4,21 @@
 
 use clap::{Parser, Subcommand};
 use kymion_audio::{analyze, decode_wav, render_with, to_wav_bytes, RenderOptions};
-use kymion_core::{command_schema, midi::{export_midi, import_midi}, Command, Engine, Project, TrackKind};
+use kymion_core::{
+    command_schema,
+    midi::{export_midi, import_midi},
+    Command, Engine, Project, TrackKind,
+};
 use serde_json::{json, Value};
 use std::io::Read;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "kymion", version, about = "Music editing + audio engine + vocal tuning (agent-first CLI)")]
+#[command(
+    name = "kymion",
+    version,
+    about = "Music editing + audio engine + vocal tuning (agent-first CLI)"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -58,9 +66,7 @@ enum Cmd {
         metronome: bool,
     },
     /// Render and report peak/RMS/clipping/duration (verify without listening).
-    Analyze {
-        path: PathBuf,
-    },
+    Analyze { path: PathBuf },
     /// Import a WAV file as an audio asset and place it as a clip.
     ImportAudio {
         project: PathBuf,
@@ -105,8 +111,10 @@ enum Cmd {
 
 fn run(cli: Cli) -> Result<Value, String> {
     let load = |p: &PathBuf| -> Result<Project, String> {
-        Project::from_json(&std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?)
-            .map_err(|e| e.to_string())
+        Project::from_json(
+            &std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?,
+        )
+        .map_err(|e| e.to_string())
     };
     match cli.cmd {
         Cmd::New { path, name, tempo } => {
@@ -160,7 +168,9 @@ fn run(cli: Cli) -> Result<Value, String> {
                 (Some(c), _) => c,
                 (None, true) => {
                     let mut s = String::new();
-                    std::io::stdin().read_to_string(&mut s).map_err(|e| e.to_string())?;
+                    std::io::stdin()
+                        .read_to_string(&mut s)
+                        .map_err(|e| e.to_string())?;
                     s
                 }
                 _ => return Err("provide --cmd '<json>' or --stdin".into()),
@@ -177,30 +187,54 @@ fn run(cli: Cli) -> Result<Value, String> {
             let mut e = Engine::new(load(&path)?);
             let mut outcomes = vec![];
             for (i, c) in cmds.into_iter().enumerate() {
-                outcomes.push(e.apply(c).map_err(|er| format!("command #{i} failed (nothing written): {er}"))?);
+                outcomes.push(
+                    e.apply(c)
+                        .map_err(|er| format!("command #{i} failed (nothing written): {er}"))?,
+                );
             }
             if !dry_run {
-                std::fs::write(out.as_ref().unwrap_or(&path), e.project.to_json()).map_err(|e| e.to_string())?;
+                std::fs::write(out.as_ref().unwrap_or(&path), e.project.to_json())
+                    .map_err(|e| e.to_string())?;
             }
-            Ok(json!({"ok": true, "applied": outcomes.len(), "outcomes": outcomes, "dry_run": dry_run}))
+            Ok(
+                json!({"ok": true, "applied": outcomes.len(), "outcomes": outcomes, "dry_run": dry_run}),
+            )
         }
         Cmd::Schema => serde_json::from_str(&command_schema()).map_err(|e| e.to_string()),
-        Cmd::Render { path, out, metronome } => {
+        Cmd::Render {
+            path,
+            out,
+            metronome,
+        } => {
             let s = render_with(&load(&path)?, &RenderOptions { metronome });
             std::fs::write(&out, to_wav_bytes(&s)).map_err(|e| e.to_string())?;
             Ok(json!({"ok": true, "out": out, "analysis": analyze(&s)}))
         }
-        Cmd::Analyze { path } => Ok(json!({"ok": true, "analysis": analyze(&render_with(&load(&path)?, &RenderOptions::default()))})),
-        Cmd::ImportAudio { project, wav, track, start } => {
+        Cmd::Analyze { path } => Ok(
+            json!({"ok": true, "analysis": analyze(&render_with(&load(&path)?, &RenderOptions::default()))}),
+        ),
+        Cmd::ImportAudio {
+            project,
+            wav,
+            track,
+            start,
+        } => {
             let bytes = std::fs::read(&wav).map_err(|e| format!("{}: {e}", wav.display()))?;
             let (sr, samples) = decode_wav(&bytes)?;
-            let name = wav.file_stem().and_then(|s| s.to_str()).unwrap_or("audio").to_string();
+            let name = wav
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("audio")
+                .to_string();
             let mut e = Engine::new(load(&project)?);
             let asset = e.import_audio(&name, sr, &samples);
             let track_id = match track {
                 Some(t) => t,
                 None => e
-                    .apply(Command::AddTrack { name: name.clone(), kind: TrackKind::Audio })
+                    .apply(Command::AddTrack {
+                        name: name.clone(),
+                        kind: TrackKind::Audio,
+                    })
                     .map_err(|er| er.to_string())?
                     .track_id
                     .unwrap(),
@@ -216,11 +250,14 @@ fn run(cli: Cli) -> Result<Value, String> {
                 })
                 .map_err(|er| er.to_string())?;
             std::fs::write(&project, e.project.to_json()).map_err(|e| e.to_string())?;
-            Ok(json!({"ok": true, "asset_id": asset, "track_id": track_id, "clip_id": o.clip_id,
-                      "duration_sec": samples.len() as f32 / sr as f32, "sample_rate": sr}))
+            Ok(
+                json!({"ok": true, "asset_id": asset, "track_id": track_id, "clip_id": o.clip_id,
+                      "duration_sec": samples.len() as f32 / sr as f32, "sample_rate": sr}),
+            )
         }
         Cmd::ImportMidi { midi_path, out } => {
-            let bytes = std::fs::read(&midi_path).map_err(|e| format!("{}: {e}", midi_path.display()))?;
+            let bytes =
+                std::fs::read(&midi_path).map_err(|e| format!("{}: {e}", midi_path.display()))?;
             let project = import_midi(&bytes).map_err(|e| e.to_string())?;
             if let Some(out_p) = &out {
                 std::fs::write(out_p, project.to_json()).map_err(|e| e.to_string())?;
@@ -245,10 +282,20 @@ fn run(cli: Cli) -> Result<Value, String> {
                 "notes": p.tracks.iter().map(|t| t.notes.len()).sum::<usize>()
             }))
         }
-        Cmd::ImportSoundfont { project, sf2, name, track, bank, preset } => {
+        Cmd::ImportSoundfont {
+            project,
+            sf2,
+            name,
+            track,
+            bank,
+            preset,
+        } => {
             let bytes = std::fs::read(&sf2).map_err(|e| format!("{}: {e}", sf2.display()))?;
             let sf_name = name.unwrap_or_else(|| {
-                sf2.file_stem().and_then(|s| s.to_str()).unwrap_or("soundfont").to_string()
+                sf2.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("soundfont")
+                    .to_string()
             });
             let presets = kymion_audio::list_soundfont_presets(&bytes);
             let mut e = Engine::new(load(&project)?);

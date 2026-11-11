@@ -73,13 +73,20 @@ pub enum TrackKind {
 
 impl TrackKind {
     pub fn instrument(waveform: Waveform) -> Self {
-        Self::Instrument { waveform, soundfont: None }
+        Self::Instrument {
+            waveform,
+            soundfont: None,
+        }
     }
 
     pub fn soundfont(asset: u32, bank: u16, preset: u16) -> Self {
         Self::Instrument {
             waveform: Waveform::Pluck,
-            soundfont: Some(SoundfontConfig { asset, bank, preset }),
+            soundfont: Some(SoundfontConfig {
+                asset,
+                bank,
+                preset,
+            }),
         }
     }
 }
@@ -183,7 +190,12 @@ impl AudioAsset {
         for s in samples {
             bytes.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
         }
-        Self { id, name: name.into(), sample_rate, data: B64.encode(bytes) }
+        Self {
+            id,
+            name: name.into(),
+            sample_rate,
+            data: B64.encode(bytes),
+        }
     }
     /// Decode to f32 mono samples.
     pub fn samples(&self) -> Vec<f32> {
@@ -424,11 +436,20 @@ impl Project {
         self.assets
             .iter()
             .find(|a| a.id == clip.asset)
-            .map(|a| self.secs_to_ticks(a.duration_secs()).saturating_sub(clip.offset_ticks))
+            .map(|a| {
+                self.secs_to_ticks(a.duration_secs())
+                    .saturating_sub(clip.offset_ticks)
+            })
             .unwrap_or(0)
     }
     pub fn length_ticks(&self) -> u32 {
-        let notes = self.tracks.iter().flat_map(|t| &t.notes).map(|n| n.start + n.duration).max().unwrap_or(0);
+        let notes = self
+            .tracks
+            .iter()
+            .flat_map(|t| &t.notes)
+            .map(|n| n.start + n.duration)
+            .max()
+            .unwrap_or(0);
         let clips = self
             .tracks
             .iter()
@@ -439,10 +460,16 @@ impl Project {
         notes.max(clips)
     }
     pub fn track(&self, id: u32) -> Result<&Track> {
-        self.tracks.iter().find(|t| t.id == id).ok_or(Error::TrackNotFound(id))
+        self.tracks
+            .iter()
+            .find(|t| t.id == id)
+            .ok_or(Error::TrackNotFound(id))
     }
     pub fn track_mut(&mut self, id: u32) -> Result<&mut Track> {
-        self.tracks.iter_mut().find(|t| t.id == id).ok_or(Error::TrackNotFound(id))
+        self.tracks
+            .iter_mut()
+            .find(|t| t.id == id)
+            .ok_or(Error::TrackNotFound(id))
     }
     pub fn alloc(&mut self) -> u32 {
         let id = self.next_id;
@@ -472,27 +499,78 @@ impl Project {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
-    SetTempo { bpm: f32 },
-    SetName { name: String },
-    AddTrack { name: String, kind: TrackKind },
-    RemoveTrack { track: u32 },
-    RenameTrack { track: u32, name: String },
-    SetMix { track: u32, gain: Option<f32>, pan: Option<f32>, mute: Option<bool>, solo: Option<bool> },
+    SetTempo {
+        bpm: f32,
+    },
+    SetName {
+        name: String,
+    },
+    AddTrack {
+        name: String,
+        kind: TrackKind,
+    },
+    RemoveTrack {
+        track: u32,
+    },
+    RenameTrack {
+        track: u32,
+        name: String,
+    },
+    SetMix {
+        track: u32,
+        gain: Option<f32>,
+        pan: Option<f32>,
+        mute: Option<bool>,
+        solo: Option<bool>,
+    },
     /// Set time signature (denominator must be 1,2,4,8 or 16).
-    SetTimeSignature { numerator: u8, denominator: u8 },
+    SetTimeSignature {
+        numerator: u8,
+        denominator: u8,
+    },
     /// Set the loop region in ticks; omit start/end to clear it.
-    SetLoop { start: Option<u32>, end: Option<u32> },
+    SetLoop {
+        start: Option<u32>,
+        end: Option<u32>,
+    },
     /// Insert many notes atomically (single undo step). Returns `note_ids`.
-    AddNotes { track: u32, notes: Vec<NewNote> },
-    RemoveNotes { track: u32, notes: Vec<u32> },
+    AddNotes {
+        track: u32,
+        notes: Vec<NewNote>,
+    },
+    RemoveNotes {
+        track: u32,
+        notes: Vec<u32>,
+    },
     /// Move many notes by a tick/pitch delta (single undo step).
-    MoveNotes { track: u32, notes: Vec<u32>, delta_tick: i32, delta_pitch: i8 },
-    SetVelocity { track: u32, notes: Vec<u32>, velocity: u8 },
+    MoveNotes {
+        track: u32,
+        notes: Vec<u32>,
+        delta_tick: i32,
+        delta_pitch: i8,
+    },
+    SetVelocity {
+        track: u32,
+        notes: Vec<u32>,
+        velocity: u8,
+    },
     /// Split a note at an absolute tick strictly inside it.
-    SplitNote { track: u32, note: u32, at: u32 },
+    SplitNote {
+        track: u32,
+        note: u32,
+        at: u32,
+    },
     /// Add/replace an automation point for gain (0..2) or pan (-1..1).
-    AddAutoPoint { track: u32, param: AutoParam, tick: u32, value: f32 },
-    ClearAuto { track: u32, param: AutoParam },
+    AddAutoPoint {
+        track: u32,
+        param: AutoParam,
+        tick: u32,
+        value: f32,
+    },
+    ClearAuto {
+        track: u32,
+        param: AutoParam,
+    },
     /// Place an imported audio asset on an audio track.
     AddClip {
         track: u32,
@@ -505,8 +583,15 @@ pub enum Command {
         #[serde(default)]
         duration_ticks: Option<u32>,
     },
-    RemoveClip { track: u32, clip: u32 },
-    MoveClip { track: u32, clip: u32, start: u32 },
+    RemoveClip {
+        track: u32,
+        clip: u32,
+    },
+    MoveClip {
+        track: u32,
+        clip: u32,
+        start: u32,
+    },
     /// Trim an audio clip's start, offset into the asset, or duration.
     TrimClip {
         track: u32,
@@ -519,9 +604,17 @@ pub enum Command {
         duration_ticks: Option<u32>,
     },
     /// Split an audio clip at an absolute timeline tick inside the clip.
-    SplitClip { track: u32, clip: u32, at: u32 },
+    SplitClip {
+        track: u32,
+        clip: u32,
+        at: u32,
+    },
     /// Set the gain multiplier (0..2) of an audio clip.
-    SetClipGain { track: u32, clip: u32, gain: f32 },
+    SetClipGain {
+        track: u32,
+        clip: u32,
+        gain: f32,
+    },
     /// Set fade-in and/or fade-out lengths in ticks for an audio clip.
     SetClipFade {
         track: u32,
@@ -540,27 +633,69 @@ pub enum Command {
         velocity: u8,
         lyric: Option<String>,
     },
-    RemoveNote { track: u32, note: u32 },
-    MoveNote { track: u32, note: u32, start: Option<u32>, pitch: Option<u8>, duration: Option<u32> },
+    RemoveNote {
+        track: u32,
+        note: u32,
+    },
+    MoveNote {
+        track: u32,
+        note: u32,
+        start: Option<u32>,
+        pitch: Option<u8>,
+        duration: Option<u32>,
+    },
     /// Assign lyrics to consecutive notes of a vocal track (one syllable per note).
-    SetLyrics { track: u32, lyrics: Vec<String> },
+    SetLyrics {
+        track: u32,
+        lyrics: Vec<String>,
+    },
     /// Tune expression for a whole track (`note` = None) or a single note.
-    SetExpression { track: u32, note: Option<u32>, expression: Expression },
+    SetExpression {
+        track: u32,
+        note: Option<u32>,
+        expression: Expression,
+    },
     /// Quantize note starts to a grid (ticks).
-    Quantize { track: u32, grid: u32 },
-    Transpose { track: u32, semitones: i8 },
+    Quantize {
+        track: u32,
+        grid: u32,
+    },
+    Transpose {
+        track: u32,
+        semitones: i8,
+    },
     /// Add an effect to a track FX chain or master bus (`track` = None).
-    AddFx { track: Option<u32>, kind: FxKind },
+    AddFx {
+        track: Option<u32>,
+        kind: FxKind,
+    },
     /// Modify effect parameters or toggle bypass.
-    SetFx { track: Option<u32>, fx: u32, kind: Option<FxKind>, enabled: Option<bool> },
+    SetFx {
+        track: Option<u32>,
+        fx: u32,
+        kind: Option<FxKind>,
+        enabled: Option<bool>,
+    },
     /// Remove an effect from an FX chain.
-    RemoveFx { track: Option<u32>, fx: u32 },
+    RemoveFx {
+        track: Option<u32>,
+        fx: u32,
+    },
     /// Add a SoundFont 2 binary asset (base64-encoded).
-    AddSoundfont { name: String, data: String },
+    AddSoundfont {
+        name: String,
+        data: String,
+    },
     /// Configure SoundFont instrument on an instrument track.
-    SetTrackSoundfont { track: u32, soundfont: Option<SoundfontConfig> },
+    SetTrackSoundfont {
+        track: u32,
+        soundfont: Option<SoundfontConfig>,
+    },
     /// Set oscillator waveform on an instrument track.
-    SetTrackWaveform { track: u32, waveform: Waveform },
+    SetTrackWaveform {
+        track: u32,
+        waveform: Waveform,
+    },
 }
 fn vel() -> u8 {
     100
@@ -625,7 +760,9 @@ impl Engine {
         self.undo.push(self.project.clone());
         self.redo.clear();
         let id = self.project.alloc();
-        self.project.assets.push(AudioAsset::from_samples(id, name, sample_rate, samples));
+        self.project
+            .assets
+            .push(AudioAsset::from_samples(id, name, sample_rate, samples));
         id
     }
 
@@ -634,7 +771,9 @@ impl Engine {
         self.undo.push(self.project.clone());
         self.redo.clear();
         let id = self.project.alloc();
-        self.project.soundfonts.push(SoundfontAsset::from_bytes(id, name, bytes));
+        self.project
+            .soundfonts
+            .push(SoundfontAsset::from_bytes(id, name, bytes));
         id
     }
 
@@ -672,7 +811,13 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
             p.track(track)?;
             p.tracks.retain(|t| t.id != track);
         }
-        Command::SetMix { track, gain, pan, mute, solo } => {
+        Command::SetMix {
+            track,
+            gain,
+            pan,
+            mute,
+            solo,
+        } => {
             let t = p.track_mut(track)?;
             if let Some(v) = solo {
                 t.solo = v;
@@ -687,7 +832,14 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
                 t.mute = m;
             }
         }
-        Command::AddNote { track, start, duration, pitch, velocity, lyric } => {
+        Command::AddNote {
+            track,
+            start,
+            duration,
+            pitch,
+            velocity,
+            lyric,
+        } => {
             if duration == 0 || pitch > 127 || velocity > 127 {
                 return Err(Error::Invalid("duration>0, pitch/velocity 0..127".into()));
             }
@@ -713,9 +865,19 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
                 return Err(Error::NoteNotFound(note));
             }
         }
-        Command::MoveNote { track, note, start, pitch, duration } => {
+        Command::MoveNote {
+            track,
+            note,
+            start,
+            pitch,
+            duration,
+        } => {
             let t = p.track_mut(track)?;
-            let n = t.notes.iter_mut().find(|x| x.id == note).ok_or(Error::NoteNotFound(note))?;
+            let n = t
+                .notes
+                .iter_mut()
+                .find(|x| x.id == note)
+                .ok_or(Error::NoteNotFound(note))?;
             if let Some(s) = start {
                 n.start = s;
             }
@@ -739,7 +901,11 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
                 n.lyric = Some(l);
             }
         }
-        Command::SetExpression { track, note, expression } => {
+        Command::SetExpression {
+            track,
+            note,
+            expression,
+        } => {
             let t = p.track_mut(track)?;
             match note {
                 None => t.expression = expression,
@@ -769,9 +935,14 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
             }
         }
         Command::RenameTrack { track, name } => p.track_mut(track)?.name = name,
-        Command::SetTimeSignature { numerator, denominator } => {
+        Command::SetTimeSignature {
+            numerator,
+            denominator,
+        } => {
             if numerator == 0 || numerator > 32 || ![1, 2, 4, 8, 16].contains(&denominator) {
-                return Err(Error::Invalid("numerator 1..32, denominator 1/2/4/8/16".into()));
+                return Err(Error::Invalid(
+                    "numerator 1..32, denominator 1/2/4/8/16".into(),
+                ));
             }
             p.time_sig_num = numerator;
             p.time_sig_den = denominator;
@@ -779,7 +950,11 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
         Command::SetLoop { start, end } => match (start, end) {
             (Some(s), Some(e)) if e > s => p.loop_region = Some(LoopRegion { start: s, end: e }),
             (None, None) => p.loop_region = None,
-            _ => return Err(Error::Invalid("loop needs start<end, or both omitted to clear".into())),
+            _ => {
+                return Err(Error::Invalid(
+                    "loop needs start<end, or both omitted to clear".into(),
+                ))
+            }
         },
         Command::AddNotes { track, notes } => {
             for n in &notes {
@@ -791,10 +966,20 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
             for n in notes {
                 let id = p.alloc();
                 let t = p.track_mut(track)?;
-                t.notes.push(Note { id, start: n.start, duration: n.duration, pitch: n.pitch, velocity: n.velocity, lyric: n.lyric, expression: None });
+                t.notes.push(Note {
+                    id,
+                    start: n.start,
+                    duration: n.duration,
+                    pitch: n.pitch,
+                    velocity: n.velocity,
+                    lyric: n.lyric,
+                    expression: None,
+                });
                 out.note_ids.push(id);
             }
-            p.track_mut(track)?.notes.sort_by_key(|n| (n.start, n.pitch));
+            p.track_mut(track)?
+                .notes
+                .sort_by_key(|n| (n.start, n.pitch));
         }
         Command::RemoveNotes { track, notes } => {
             let t = p.track_mut(track)?;
@@ -805,7 +990,12 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
             }
             t.notes.retain(|n| !notes.contains(&n.id));
         }
-        Command::MoveNotes { track, notes, delta_tick, delta_pitch } => {
+        Command::MoveNotes {
+            track,
+            notes,
+            delta_tick,
+            delta_pitch,
+        } => {
             let t = p.track_mut(track)?;
             for id in &notes {
                 if !t.notes.iter().any(|n| n.id == *id) {
@@ -818,7 +1008,11 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
             }
             t.notes.sort_by_key(|n| (n.start, n.pitch));
         }
-        Command::SetVelocity { track, notes, velocity } => {
+        Command::SetVelocity {
+            track,
+            notes,
+            velocity,
+        } => {
             if velocity > 127 {
                 return Err(Error::Invalid("velocity 0..127".into()));
             }
@@ -830,17 +1024,34 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
         Command::SplitNote { track, note, at } => {
             let new_id = p.alloc();
             let t = p.track_mut(track)?;
-            let n = t.notes.iter_mut().find(|x| x.id == note).ok_or(Error::NoteNotFound(note))?;
+            let n = t
+                .notes
+                .iter_mut()
+                .find(|x| x.id == note)
+                .ok_or(Error::NoteNotFound(note))?;
             if at <= n.start || at >= n.start + n.duration {
                 return Err(Error::Invalid("split point must be inside the note".into()));
             }
-            let tail = Note { id: new_id, start: at, duration: n.start + n.duration - at, pitch: n.pitch, velocity: n.velocity, lyric: None, expression: n.expression.clone() };
+            let tail = Note {
+                id: new_id,
+                start: at,
+                duration: n.start + n.duration - at,
+                pitch: n.pitch,
+                velocity: n.velocity,
+                lyric: None,
+                expression: n.expression.clone(),
+            };
             n.duration = at - n.start;
             t.notes.push(tail);
             t.notes.sort_by_key(|n| (n.start, n.pitch));
             out.note_id = Some(new_id);
         }
-        Command::AddAutoPoint { track, param, tick, value } => {
+        Command::AddAutoPoint {
+            track,
+            param,
+            tick,
+            value,
+        } => {
             let t = p.track_mut(track)?;
             let (list, v) = match param {
                 AutoParam::Gain => (&mut t.gain_auto, value.clamp(0.0, 2.0)),
@@ -857,14 +1068,23 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
                 AutoParam::Pan => t.pan_auto.clear(),
             }
         }
-        Command::AddClip { track, asset, start, gain, offset_ticks, duration_ticks } => {
+        Command::AddClip {
+            track,
+            asset,
+            start,
+            gain,
+            offset_ticks,
+            duration_ticks,
+        } => {
             if !p.assets.iter().any(|a| a.id == asset) {
                 return Err(Error::AssetNotFound(asset));
             }
             let id = p.alloc();
             let t = p.track_mut(track)?;
             if t.kind != TrackKind::Audio {
-                return Err(Error::Invalid("clips can only be placed on audio tracks".into()));
+                return Err(Error::Invalid(
+                    "clips can only be placed on audio tracks".into(),
+                ));
             }
             t.clips.push(AudioClip {
                 id,
@@ -888,11 +1108,25 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
         }
         Command::MoveClip { track, clip, start } => {
             let t = p.track_mut(track)?;
-            t.clips.iter_mut().find(|c| c.id == clip).ok_or(Error::ClipNotFound(clip))?.start = start;
+            t.clips
+                .iter_mut()
+                .find(|c| c.id == clip)
+                .ok_or(Error::ClipNotFound(clip))?
+                .start = start;
         }
-        Command::TrimClip { track, clip, start, offset_ticks, duration_ticks } => {
+        Command::TrimClip {
+            track,
+            clip,
+            start,
+            offset_ticks,
+            duration_ticks,
+        } => {
             let t = p.track_mut(track)?;
-            let c = t.clips.iter_mut().find(|c| c.id == clip).ok_or(Error::ClipNotFound(clip))?;
+            let c = t
+                .clips
+                .iter_mut()
+                .find(|c| c.id == clip)
+                .ok_or(Error::ClipNotFound(clip))?;
             if let Some(s) = start {
                 c.start = s;
             }
@@ -910,13 +1144,23 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
             let (asset, gain, offset_ticks, fade_out_ticks, delta, rem) = {
                 let clip_len = {
                     let t = p.track(track)?;
-                    let c = t.clips.iter().find(|c| c.id == clip).ok_or(Error::ClipNotFound(clip))?;
+                    let c = t
+                        .clips
+                        .iter()
+                        .find(|c| c.id == clip)
+                        .ok_or(Error::ClipNotFound(clip))?;
                     p.clip_len_ticks(c)
                 };
                 let t = p.track_mut(track)?;
-                let c = t.clips.iter_mut().find(|c| c.id == clip).ok_or(Error::ClipNotFound(clip))?;
+                let c = t
+                    .clips
+                    .iter_mut()
+                    .find(|c| c.id == clip)
+                    .ok_or(Error::ClipNotFound(clip))?;
                 if at <= c.start || at >= c.start + clip_len {
-                    return Err(Error::Invalid("split point must be strictly inside the clip".into()));
+                    return Err(Error::Invalid(
+                        "split point must be strictly inside the clip".into(),
+                    ));
                 }
                 let delta = at - c.start;
                 let rem = clip_len - delta;
@@ -946,12 +1190,25 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
         }
         Command::SetClipGain { track, clip, gain } => {
             let t = p.track_mut(track)?;
-            let c = t.clips.iter_mut().find(|c| c.id == clip).ok_or(Error::ClipNotFound(clip))?;
+            let c = t
+                .clips
+                .iter_mut()
+                .find(|c| c.id == clip)
+                .ok_or(Error::ClipNotFound(clip))?;
             c.gain = gain.clamp(0.0, 2.0);
         }
-        Command::SetClipFade { track, clip, fade_in_ticks, fade_out_ticks } => {
+        Command::SetClipFade {
+            track,
+            clip,
+            fade_in_ticks,
+            fade_out_ticks,
+        } => {
             let t = p.track_mut(track)?;
-            let c = t.clips.iter_mut().find(|c| c.id == clip).ok_or(Error::ClipNotFound(clip))?;
+            let c = t
+                .clips
+                .iter_mut()
+                .find(|c| c.id == clip)
+                .ok_or(Error::ClipNotFound(clip))?;
             if let Some(fi) = fade_in_ticks {
                 c.fade_in_ticks = fi;
             }
@@ -977,12 +1234,20 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
             }
             out.fx_id = Some(id);
         }
-        Command::SetFx { track, fx, kind, enabled } => {
+        Command::SetFx {
+            track,
+            fx,
+            kind,
+            enabled,
+        } => {
             let fx_list = match track {
                 Some(t_id) => &mut p.track_mut(t_id)?.fx,
                 None => &mut p.master_fx,
             };
-            let item = fx_list.iter_mut().find(|f| f.id == fx).ok_or(Error::FxNotFound(fx))?;
+            let item = fx_list
+                .iter_mut()
+                .find(|f| f.id == fx)
+                .ok_or(Error::FxNotFound(fx))?;
             if let Some(k) = kind {
                 item.kind = k;
             }
@@ -1014,7 +1279,9 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
             }
             let t = p.track_mut(track)?;
             match &mut t.kind {
-                TrackKind::Instrument { soundfont: sf_slot, .. } => {
+                TrackKind::Instrument {
+                    soundfont: sf_slot, ..
+                } => {
                     *sf_slot = soundfont;
                 }
                 _ => return Err(Error::Invalid("track is not an instrument track".into())),
@@ -1044,7 +1311,9 @@ mod tests {
     fn add_undo_redo() {
         let mut e = Engine::default();
         let o = e
-            .apply_json(r#"{"cmd":"add_track","name":"Lead","kind":{"type":"vocal","voice":"default"}}"#)
+            .apply_json(
+                r#"{"cmd":"add_track","name":"Lead","kind":{"type":"vocal","voice":"default"}}"#,
+            )
             .unwrap();
         let t = o.track_id.unwrap();
         e.apply(Command::AddNote {
@@ -1066,27 +1335,75 @@ mod tests {
     #[test]
     fn batch_note_ops_and_split() {
         let mut e = Engine::default();
-        let t = e.apply(Command::AddTrack { name: "k".into(), kind: TrackKind::instrument(Waveform::Sine) }).unwrap().track_id.unwrap();
+        let t = e
+            .apply(Command::AddTrack {
+                name: "k".into(),
+                kind: TrackKind::instrument(Waveform::Sine),
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
         let ids = e
             .apply(Command::AddNotes {
                 track: t,
-                notes: (0..4).map(|i| NewNote { start: i * 480, duration: 480, pitch: 60, velocity: 90, lyric: None }).collect(),
+                notes: (0..4)
+                    .map(|i| NewNote {
+                        start: i * 480,
+                        duration: 480,
+                        pitch: 60,
+                        velocity: 90,
+                        lyric: None,
+                    })
+                    .collect(),
             })
             .unwrap()
             .note_ids;
         assert_eq!(ids.len(), 4);
-        e.apply(Command::MoveNotes { track: t, notes: ids[..2].to_vec(), delta_tick: 10, delta_pitch: 2 }).unwrap();
-        assert_eq!(e.project.tracks[0].notes.iter().filter(|n| n.pitch == 62).count(), 2);
-        e.apply(Command::SplitNote { track: t, note: ids[3], at: 3 * 480 + 240 }).unwrap();
+        e.apply(Command::MoveNotes {
+            track: t,
+            notes: ids[..2].to_vec(),
+            delta_tick: 10,
+            delta_pitch: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            e.project.tracks[0]
+                .notes
+                .iter()
+                .filter(|n| n.pitch == 62)
+                .count(),
+            2
+        );
+        e.apply(Command::SplitNote {
+            track: t,
+            note: ids[3],
+            at: 3 * 480 + 240,
+        })
+        .unwrap();
         assert_eq!(e.project.tracks[0].notes.len(), 5);
-        assert!(e.apply(Command::SplitNote { track: t, note: ids[3], at: 5 }).is_err());
+        assert!(e
+            .apply(Command::SplitNote {
+                track: t,
+                note: ids[3],
+                at: 5
+            })
+            .is_err());
         e.undo().unwrap();
         assert_eq!(e.project.tracks[0].notes.len(), 4);
     }
 
     #[test]
     fn automation_eval() {
-        let pts = vec![AutoPoint { tick: 0, value: 0.0 }, AutoPoint { tick: 480, value: 1.0 }];
+        let pts = vec![
+            AutoPoint {
+                tick: 0,
+                value: 0.0,
+            },
+            AutoPoint {
+                tick: 480,
+                value: 1.0,
+            },
+        ];
         assert!((eval_auto(&pts, 240.0, 0.5) - 0.5).abs() < 1e-6);
         assert_eq!(eval_auto(&pts, 9999.0, 0.5), 1.0);
         assert_eq!(eval_auto(&[], 10.0, 0.7), 0.7);
@@ -1096,15 +1413,52 @@ mod tests {
     fn audio_asset_clip_and_loop() {
         let mut e = Engine::default();
         let asset = e.import_audio("tone", 44100, &vec![0.5; 44100]);
-        let t = e.apply(Command::AddTrack { name: "a".into(), kind: TrackKind::Audio }).unwrap().track_id.unwrap();
-        e.apply(Command::AddClip { track: t, asset, start: 480, gain: None, offset_ticks: None, duration_ticks: None }).unwrap();
+        let t = e
+            .apply(Command::AddTrack {
+                name: "a".into(),
+                kind: TrackKind::Audio,
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
+        e.apply(Command::AddClip {
+            track: t,
+            asset,
+            start: 480,
+            gain: None,
+            offset_ticks: None,
+            duration_ticks: None,
+        })
+        .unwrap();
         // 1 second at 120bpm = 2 beats = 960 ticks
         assert_eq!(e.project.length_ticks(), 480 + 960);
         assert!(e.project.to_json_light().len() < e.project.to_json().len());
-        assert!(e.apply(Command::AddClip { track: t, asset: 999, start: 0, gain: None, offset_ticks: None, duration_ticks: None }).is_err());
-        e.apply(Command::SetLoop { start: Some(0), end: Some(1920) }).unwrap();
-        assert!(e.apply(Command::SetLoop { start: Some(5), end: Some(2) }).is_err());
-        e.apply(Command::SetTimeSignature { numerator: 6, denominator: 8 }).unwrap();
+        assert!(e
+            .apply(Command::AddClip {
+                track: t,
+                asset: 999,
+                start: 0,
+                gain: None,
+                offset_ticks: None,
+                duration_ticks: None
+            })
+            .is_err());
+        e.apply(Command::SetLoop {
+            start: Some(0),
+            end: Some(1920),
+        })
+        .unwrap();
+        assert!(e
+            .apply(Command::SetLoop {
+                start: Some(5),
+                end: Some(2)
+            })
+            .is_err());
+        e.apply(Command::SetTimeSignature {
+            numerator: 6,
+            denominator: 8,
+        })
+        .unwrap();
         assert_eq!(e.project.bar_ticks(), 240 * 6);
     }
 
@@ -1155,16 +1509,50 @@ mod tests {
     fn clip_trim_split_fade_and_gain() {
         let mut e = Engine::default();
         let asset = e.import_audio("sample", 44100, &vec![0.8; 44100 * 2]); // 2 seconds = 1920 ticks
-        let t = e.apply(Command::AddTrack { name: "Audio".into(), kind: TrackKind::Audio }).unwrap().track_id.unwrap();
-        let c = e.apply(Command::AddClip { track: t, asset, start: 0, gain: Some(0.9), offset_ticks: None, duration_ticks: None }).unwrap().clip_id.unwrap();
-        assert_eq!(e.project.clip_len_ticks(&e.project.tracks[0].clips[0]), 1920);
+        let t = e
+            .apply(Command::AddTrack {
+                name: "Audio".into(),
+                kind: TrackKind::Audio,
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
+        let c = e
+            .apply(Command::AddClip {
+                track: t,
+                asset,
+                start: 0,
+                gain: Some(0.9),
+                offset_ticks: None,
+                duration_ticks: None,
+            })
+            .unwrap()
+            .clip_id
+            .unwrap();
+        assert_eq!(
+            e.project.clip_len_ticks(&e.project.tracks[0].clips[0]),
+            1920
+        );
 
         // Trim duration to 960
-        e.apply(Command::TrimClip { track: t, clip: c, start: None, offset_ticks: None, duration_ticks: Some(960) }).unwrap();
+        e.apply(Command::TrimClip {
+            track: t,
+            clip: c,
+            start: None,
+            offset_ticks: None,
+            duration_ticks: Some(960),
+        })
+        .unwrap();
         assert_eq!(e.project.clip_len_ticks(&e.project.tracks[0].clips[0]), 960);
 
         // Split at 480
-        let o = e.apply(Command::SplitClip { track: t, clip: c, at: 480 }).unwrap();
+        let o = e
+            .apply(Command::SplitClip {
+                track: t,
+                clip: c,
+                at: 480,
+            })
+            .unwrap();
         let c2 = o.clip_id.unwrap();
         assert_eq!(e.project.tracks[0].clips.len(), 2);
         assert_eq!(e.project.tracks[0].clips[0].duration_ticks, Some(480));
@@ -1173,9 +1561,20 @@ mod tests {
         assert_eq!(e.project.tracks[0].clips[1].duration_ticks, Some(480));
 
         // Set gain & fade
-        e.apply(Command::SetClipGain { track: t, clip: c2, gain: 1.5 }).unwrap();
+        e.apply(Command::SetClipGain {
+            track: t,
+            clip: c2,
+            gain: 1.5,
+        })
+        .unwrap();
         assert_eq!(e.project.tracks[0].clips[1].gain, 1.5);
-        e.apply(Command::SetClipFade { track: t, clip: c2, fade_in_ticks: Some(120), fade_out_ticks: Some(60) }).unwrap();
+        e.apply(Command::SetClipFade {
+            track: t,
+            clip: c2,
+            fade_in_ticks: Some(120),
+            fade_out_ticks: Some(60),
+        })
+        .unwrap();
         assert_eq!(e.project.tracks[0].clips[1].fade_in_ticks, 120);
         assert_eq!(e.project.tracks[0].clips[1].fade_out_ticks, 60);
 
@@ -1214,7 +1613,10 @@ mod tests {
         .unwrap();
 
         match &e.project.tracks[0].kind {
-            TrackKind::Instrument { soundfont: Some(sf), .. } => {
+            TrackKind::Instrument {
+                soundfont: Some(sf),
+                ..
+            } => {
                 assert_eq!(sf.asset, sf_id);
                 assert_eq!(sf.preset, 0);
             }
