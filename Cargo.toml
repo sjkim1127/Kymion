@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/sjkim1127/Kymion"
+authors = ["sjkim1127"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+thiserror = "1"
+hound = "3.5"
+clap = { version = "4", features = ["derive"] }
+wasm-bindgen = "0.2"
+kymion-core = { path = "crates/kymion-core" }
+kymion-dsp = { path = "crates/kymion-dsp" }
+kymion-vocal = { path = "crates/kymion-vocal" }
+kymion-audio = { path = "crates/kymion-audio" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

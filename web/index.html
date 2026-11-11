@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kymion</title>
+<link rel="icon" href="logo.svg">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <img src="logo.svg" alt="Kymion" class="logo">
+  <h1>KYMION</h1>
+  <div class="spacer"></div>
+  <button id="play">▶ Play</button>
+  <button id="stop">■ Stop</button>
+  <button id="undo">↶</button>
+  <button id="redo">↷</button>
+  <label>BPM <input id="tempo" type="number" min="20" max="400" value="120"></label>
+  <button id="wav">Export WAV</button>
+  <button id="save">Save JSON</button>
+  <button id="load">Load JSON</button>
+  <input id="file" type="file" accept=".json" hidden>
+</header>
+<main>
+  <aside>
+    <h2>Tracks</h2>
+    <div id="tracks"></div>
+    <button id="add-inst">+ Instrument</button>
+    <button id="add-vocal">+ Vocal</button>
+    <h2>Vocal tuning</h2>
+    <div id="expr"></div>
+    <h2>Agent console</h2>
+    <textarea id="cmd" rows="6" spellcheck="false">{"cmd":"add_note","track":1,"start":0,"duration":480,"pitch":64,"lyric":"la"}</textarea>
+    <button id="run">Apply command(s)</button>
+    <pre id="log"></pre>
+  </aside>
+  <section><canvas id="roll"></canvas></section>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+[package]
+name = "kymion-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "kymion"
+path = "src/main.rs"
+
+[dependencies]
+kymion-core.workspace = true
+kymion-audio.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true

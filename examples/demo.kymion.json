@@ -1,0 +1,110 @@
+{
+  "name": "Kymion Demo",
+  "sample_rate": 44100,
+  "tempo": 100.0,
+  "tracks": [
+    {
+      "id": 1,
+      "name": "Piano",
+      "kind": {
+        "type": "instrument",
+        "waveform": "pluck"
+      },
+      "gain": 0.8,
+      "pan": 0.0,
+      "mute": false,
+      "expression": {
+        "vibrato_depth": 30.0,
+        "vibrato_rate": 5.5,
+        "vibrato_delay": 0.25,
+        "portamento": 0.04,
+        "breath": 0.1,
+        "formant_shift": 0.0
+      },
+      "notes": [
+        {
+          "id": 3,
+          "start": 0,
+          "duration": 480,
+          "pitch": 48,
+          "velocity": 100
+        },
+        {
+          "id": 4,
+          "start": 480,
+          "duration": 480,
+          "pitch": 52,
+          "velocity": 100
+        },
+        {
+          "id": 5,
+          "start": 960,
+          "duration": 480,
+          "pitch": 55,
+          "velocity": 100
+        },
+        {
+          "id": 6,
+          "start": 1440,
+          "duration": 480,
+          "pitch": 60,
+          "velocity": 100
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Lead Vocal",
+      "kind": {
+        "type": "vocal",
+        "voice": "default"
+      },
+      "gain": 0.8,
+      "pan": 0.0,
+      "mute": false,
+      "expression": {
+        "vibrato_depth": 45.0,
+        "vibrato_rate": 5.5,
+        "vibrato_delay": 0.2,
+        "portamento": 0.06,
+        "breath": 0.12,
+        "formant_shift": 0.0
+      },
+      "notes": [
+        {
+          "id": 7,
+          "start": 0,
+          "duration": 480,
+          "pitch": 64,
+          "velocity": 100,
+          "lyric": "안"
+        },
+        {
+          "id": 8,
+          "start": 480,
+          "duration": 480,
+          "pitch": 67,
+          "velocity": 100,
+          "lyric": "녕"
+        },
+        {
+          "id": 9,
+          "start": 960,
+          "duration": 480,
+          "pitch": 69,
+          "velocity": 100,
+          "lyric": "키"
+        },
+        {
+          "id": 10,
+          "start": 1440,
+          "duration": 480,
+          "pitch": 72,
+          "velocity": 100,
+          "lyric": "미온"
+        }
+      ]
+    }
+  ],
+  "next_id": 11
+}

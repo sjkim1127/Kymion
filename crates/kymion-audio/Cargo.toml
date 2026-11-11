@@ -1,0 +1,15 @@
+[package]
+name = "kymion-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+kymion-core.workspace = true
+kymion-dsp.workspace = true
+kymion-vocal.workspace = true
+hound.workspace = true
+serde.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,99 @@
+//! `kymion` — agent-friendly CLI. Every command prints exactly one JSON
+//! document on stdout; failures print `{"ok":false,"error":...}` and exit 1.
+//! Project files are plain JSON, edits are JSON commands (see `kymion schema`).
+
+use clap::{Parser, Subcommand};
+use kymion_audio::{analyze, render, to_wav_bytes};
+use kymion_core::{command_schema, Command, Engine, Project};
+use serde_json::{json, Value};
+use std::io::Read;
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(name = "kymion", version, about = "Music editing + audio engine + vocal tuning (agent-first CLI)")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Create a new project file.
+    New { path: PathBuf, #[arg(long, default_value = "Untitled")] name: String, #[arg(long, default_value_t = 120.0)] tempo: f32 },
+    /// Print project summary (tracks, notes, length).
+    Info { path: PathBuf, #[arg(long)] full: bool },
+    /// Apply JSON command(s): one object or an array. Use --cmd or --stdin.
+    Apply {
+        path: PathBuf,
+        #[arg(long)] cmd: Option<String>,
+        #[arg(long)] stdin: bool,
+        /// Write result here instead of editing in place.
+        #[arg(long)] out: Option<PathBuf>,
+        /// Validate only; do not write.
+        #[arg(long)] dry_run: bool,
+    },
+    /// Print the JSON Schema of the command protocol.
+    Schema,
+    /// Render project to a WAV file.
+    Render { path: PathBuf, #[arg(short, long)] out: PathBuf },
+    /// Render and report peak/RMS/clipping/duration (verify without listening).
+    Analyze { path: PathBuf },
+}
+
+fn run(cli: Cli) -> Result<Value, String> {
+    let load = |p: &PathBuf| -> Result<Project, String> {
+        Project::from_json(&std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?).map_err(|e| e.to_string())
+    };
+    match cli.cmd {
+        Cmd::New { path, name, tempo } => {
+            let mut p = Project::new(name);
+            p.tempo = tempo;
+            std::fs::write(&path, p.to_json()).map_err(|e| e.to_string())?;
+            Ok(json!({"ok": true, "path": path}))
+        }
+        Cmd::Info { path, full } => {
+            let p = load(&path)?;
+            if full { return serde_json::to_value(&p).map_err(|e| e.to_string()); }
+            let tracks: Vec<Value> = p.tracks.iter().map(|t| json!({"id": t.id, "name": t.name, "kind": t.kind, "notes": t.notes.len(), "mute": t.mute})).collect();
+            Ok(json!({"ok": true, "name": p.name, "tempo": p.tempo, "length_ticks": p.length_ticks(), "length_sec": p.ticks_to_secs(p.length_ticks()), "tracks": tracks}))
+        }
+        Cmd::Apply { path, cmd, stdin, out, dry_run } => {
+            let raw = match (cmd, stdin) {
+                (Some(c), _) => c,
+                (None, true) => { let mut s = String::new(); std::io::stdin().read_to_string(&mut s).map_err(|e| e.to_string())?; s }
+                _ => return Err("provide --cmd '<json>' or --stdin".into()),
+            };
+            let v: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            let cmds: Vec<Command> = match v {
+                Value::Array(a) => a.into_iter().map(serde_json::from_value).collect::<Result<_, _>>().map_err(|e| e.to_string())?,
+                o => vec![serde_json::from_value(o).map_err(|e| e.to_string())?],
+            };
+            let mut e = Engine::new(load(&path)?);
+            let mut outcomes = vec![];
+            for (i, c) in cmds.into_iter().enumerate() {
+                outcomes.push(e.apply(c).map_err(|er| format!("command #{i} failed (nothing written): {er}"))?);
+            }
+            if !dry_run {
+                std::fs::write(out.as_ref().unwrap_or(&path), e.project.to_json()).map_err(|e| e.to_string())?;
+            }
+            Ok(json!({"ok": true, "applied": outcomes.len(), "outcomes": outcomes, "dry_run": dry_run}))
+        }
+        Cmd::Schema => serde_json::from_str(&command_schema()).map_err(|e| e.to_string()),
+        Cmd::Render { path, out } => {
+            let s = render(&load(&path)?);
+            std::fs::write(&out, to_wav_bytes(&s)).map_err(|e| e.to_string())?;
+            Ok(json!({"ok": true, "out": out, "analysis": analyze(&s)}))
+        }
+        Cmd::Analyze { path } => Ok(json!({"ok": true, "analysis": analyze(&render(&load(&path)?))})),
+    }
+}
+
+fn main() {
+    match run(Cli::parse()) {
+        Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
+        Err(e) => {
+            println!("{}", json!({"ok": false, "error": e}));
+            std::process::exit(1);
+        }
+    }
+}

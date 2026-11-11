@@ -1,0 +1,14 @@
+[
+  {"cmd":"add_track","name":"Piano","kind":{"type":"instrument","waveform":"pluck"}},
+  {"cmd":"add_track","name":"Lead Vocal","kind":{"type":"vocal","voice":"default"}},
+  {"cmd":"add_note","track":1,"start":0,"duration":480,"pitch":48},
+  {"cmd":"add_note","track":1,"start":480,"duration":480,"pitch":52},
+  {"cmd":"add_note","track":1,"start":960,"duration":480,"pitch":55},
+  {"cmd":"add_note","track":1,"start":1440,"duration":480,"pitch":60},
+  {"cmd":"add_note","track":2,"start":0,"duration":480,"pitch":64},
+  {"cmd":"add_note","track":2,"start":480,"duration":480,"pitch":67},
+  {"cmd":"add_note","track":2,"start":960,"duration":480,"pitch":69},
+  {"cmd":"add_note","track":2,"start":1440,"duration":480,"pitch":72},
+  {"cmd":"set_lyrics","track":2,"lyrics":["안","녕","키","미온"]},
+  {"cmd":"set_expression","track":2,"expression":{"vibrato_depth":45,"vibrato_rate":5.5,"vibrato_delay":0.2,"portamento":0.06,"breath":0.12,"formant_shift":0}}
+]
