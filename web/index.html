@@ -17,22 +17,45 @@
   <button id="undo">↶</button>
   <button id="redo">↷</button>
   <label>BPM <input id="tempo" type="number" min="20" max="400" value="120"></label>
+  <div class="divider"></div>
+  <button id="import-midi">Import MIDI</button>
+  <button id="export-midi">Export MIDI</button>
   <button id="wav">Export WAV</button>
   <button id="save">Save JSON</button>
   <button id="load">Load JSON</button>
   <input id="file" type="file" accept=".json" hidden>
+  <input id="midi-file" type="file" accept=".mid,.midi" hidden>
 </header>
 <main>
   <aside>
     <h2>Tracks</h2>
     <div id="tracks"></div>
-    <button id="add-inst">+ Instrument</button>
-    <button id="add-vocal">+ Vocal</button>
-    <h2>Vocal tuning</h2>
+    <div class="btn-row">
+      <button id="add-inst">+ Instrument</button>
+      <button id="add-vocal">+ Vocal</button>
+    </div>
+
+    <h2>Track FX Chain</h2>
+    <div id="fx-rack"></div>
+    <div class="btn-row">
+      <button id="add-fx-eq">+ EQ</button>
+      <button id="add-fx-delay">+ Delay</button>
+      <button id="add-fx-reverb">+ Reverb</button>
+    </div>
+
+    <h2>Vocal Tuning</h2>
     <div id="expr"></div>
-    <h2>Agent console</h2>
-    <textarea id="cmd" rows="6" spellcheck="false">{"cmd":"add_note","track":1,"start":0,"duration":480,"pitch":64,"lyric":"la"}</textarea>
-    <button id="run">Apply command(s)</button>
+
+    <h2>Master Bus FX</h2>
+    <div id="master-fx-rack"></div>
+    <div class="btn-row">
+      <button id="add-master-fx-eq">+ Master EQ</button>
+      <button id="add-master-fx-comp">+ Master Comp</button>
+    </div>
+
+    <h2>Agent Console</h2>
+    <textarea id="cmd" rows="5" spellcheck="false">{"cmd":"add_fx","track":1,"kind":{"type":"reverb","room_size":0.7,"damping":0.3,"width":1.0,"mix":0.35}}</textarea>
+    <button id="run">Apply Command(s)</button>
     <pre id="log"></pre>
   </aside>
   <section><canvas id="roll"></canvas></section>

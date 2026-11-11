@@ -1,4 +1,4 @@
-//! Kymion DSP primitives: oscillators, envelopes, filters, noise.
+//! Kymion DSP primitives: oscillators, envelopes, filters, noise, and audio effects.
 
 use std::f32::consts::TAU;
 
@@ -13,9 +13,15 @@ pub struct Osc {
 }
 impl Osc {
     fn polyblep(t: f32, dt: f32) -> f32 {
-        if t < dt { let x = t / dt; x + x - x * x - 1.0 }
-        else if t > 1.0 - dt { let x = (t - 1.0) / dt; x * x + x + x + 1.0 }
-        else { 0.0 }
+        if t < dt {
+            let x = t / dt;
+            x + x - x * x - 1.0
+        } else if t > 1.0 - dt {
+            let x = (t - 1.0) / dt;
+            x * x + x + x + 1.0
+        } else {
+            0.0
+        }
     }
     pub fn sine(&mut self, hz: f32, sr: f32) -> f32 {
         let v = (self.phase * TAU).sin();
@@ -44,36 +50,90 @@ impl Osc {
     /// Glottal-like pulse: band-rich source used for voice synthesis.
     pub fn glottal(&mut self, hz: f32, sr: f32) -> f32 {
         let p = self.phase;
-        let v = if p < 0.6 { (p / 0.6 * std::f32::consts::PI).sin() } else { -0.3 * ((p - 0.6) / 0.4 * std::f32::consts::PI).sin() };
+        let v = if p < 0.6 {
+            (p / 0.6 * std::f32::consts::PI).sin()
+        } else {
+            -0.3 * ((p - 0.6) / 0.4 * std::f32::consts::PI).sin()
+        };
         self.advance(hz, sr);
         v
     }
     fn advance(&mut self, hz: f32, sr: f32) {
         self.phase += hz / sr;
-        if self.phase >= 1.0 { self.phase -= 1.0; }
+        if self.phase >= 1.0 {
+            self.phase -= 1.0;
+        }
     }
 }
 
 /// Linear ADSR; call `gate_off` to release.
 #[derive(Clone)]
-pub struct Adsr { a: f32, d: f32, s: f32, r: f32, level: f32, stage: u8, sr: f32 }
+pub struct Adsr {
+    a: f32,
+    d: f32,
+    s: f32,
+    r: f32,
+    level: f32,
+    stage: u8,
+    sr: f32,
+}
 impl Adsr {
-    pub fn new(a: f32, d: f32, s: f32, r: f32, sr: f32) -> Self { Self { a, d, s, r, level: 0.0, stage: 0, sr } }
-    pub fn gate_off(&mut self) { if self.stage < 3 { self.stage = 3; } }
+    pub fn new(a: f32, d: f32, s: f32, r: f32, sr: f32) -> Self {
+        Self {
+            a,
+            d,
+            s,
+            r,
+            level: 0.0,
+            stage: 0,
+            sr,
+        }
+    }
+    pub fn gate_off(&mut self) {
+        if self.stage < 3 {
+            self.stage = 3;
+        }
+    }
     pub fn next(&mut self) -> f32 {
         match self.stage {
-            0 => { self.level += 1.0 / (self.a * self.sr).max(1.0); if self.level >= 1.0 { self.level = 1.0; self.stage = 1; } }
-            1 => { self.level -= (1.0 - self.s) / (self.d * self.sr).max(1.0); if self.level <= self.s { self.level = self.s; self.stage = 2; } }
+            0 => {
+                self.level += 1.0 / (self.a * self.sr).max(1.0);
+                if self.level >= 1.0 {
+                    self.level = 1.0;
+                    self.stage = 1;
+                }
+            }
+            1 => {
+                self.level -= (1.0 - self.s) / (self.d * self.sr).max(1.0);
+                if self.level <= self.s {
+                    self.level = self.s;
+                    self.stage = 2;
+                }
+            }
             2 => {}
-            _ => { self.level -= self.s.max(0.001) / (self.r * self.sr).max(1.0); if self.level < 0.0 { self.level = 0.0; } }
+            _ => {
+                self.level -= self.s.max(0.001) / (self.r * self.sr).max(1.0);
+                if self.level < 0.0 {
+                    self.level = 0.0;
+                }
+            }
         }
         self.level
     }
 }
 
-/// Resonant two-pole bandpass (RBJ biquad), used as a formant resonator.
+/// Resonant biquad filter (RBJ Audio EQ Cookbook).
 #[derive(Clone, Default)]
-pub struct Biquad { b0: f32, b1: f32, b2: f32, a1: f32, a2: f32, z1: f32, z2: f32 }
+pub struct Biquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    z1: f32,
+    z2: f32,
+}
+
 impl Biquad {
     pub fn bandpass(freq: f32, q: f32, sr: f32) -> Self {
         let mut b = Self::default();
@@ -81,19 +141,86 @@ impl Biquad {
         b
     }
     pub fn set_bandpass(&mut self, freq: f32, q: f32, sr: f32) {
-        let w = TAU * freq.min(sr * 0.45) / sr;
-        let alpha = w.sin() / (2.0 * q);
+        let w = TAU * freq.clamp(20.0, sr * 0.45) / sr;
+        let alpha = w.sin() / (2.0 * q.max(0.1));
         let a0 = 1.0 + alpha;
-        self.b0 = alpha / a0; self.b1 = 0.0; self.b2 = -alpha / a0;
-        self.a1 = -2.0 * w.cos() / a0; self.a2 = (1.0 - alpha) / a0;
+        self.b0 = alpha / a0;
+        self.b1 = 0.0;
+        self.b2 = -alpha / a0;
+        self.a1 = -2.0 * w.cos() / a0;
+        self.a2 = (1.0 - alpha) / a0;
     }
     pub fn lowpass(freq: f32, q: f32, sr: f32) -> Self {
-        let w = TAU * freq.min(sr * 0.45) / sr;
-        let alpha = w.sin() / (2.0 * q);
+        let w = TAU * freq.clamp(20.0, sr * 0.45) / sr;
+        let alpha = w.sin() / (2.0 * q.max(0.1));
         let a0 = 1.0 + alpha;
         let c = w.cos();
-        Self { b0: (1.0 - c) / 2.0 / a0, b1: (1.0 - c) / a0, b2: (1.0 - c) / 2.0 / a0, a1: -2.0 * c / a0, a2: (1.0 - alpha) / a0, z1: 0.0, z2: 0.0 }
+        Self {
+            b0: (1.0 - c) / 2.0 / a0,
+            b1: (1.0 - c) / a0,
+            b2: (1.0 - c) / 2.0 / a0,
+            a1: -2.0 * c / a0,
+            a2: (1.0 - alpha) / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
     }
+    pub fn low_shelf(freq: f32, gain_db: f32, sr: f32) -> Self {
+        let a = 10f32.powf(gain_db / 40.0);
+        let w0 = TAU * freq.clamp(20.0, sr * 0.45) / sr;
+        let cos_w0 = w0.cos();
+        let sin_w0 = w0.sin();
+        let alpha = sin_w0 / 2.0 * 2.0f32.sqrt();
+        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+
+        let a0 = (a + 1.0) + (a - 1.0) * cos_w0 + two_sqrt_a_alpha;
+        Self {
+            b0: (a * ((a + 1.0) - (a - 1.0) * cos_w0 + two_sqrt_a_alpha)) / a0,
+            b1: (2.0 * a * ((a - 1.0) - (a + 1.0) * cos_w0)) / a0,
+            b2: (a * ((a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha)) / a0,
+            a1: (-2.0 * ((a - 1.0) + (a + 1.0) * cos_w0)) / a0,
+            a2: ((a + 1.0) + (a - 1.0) * cos_w0 - two_sqrt_a_alpha) / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+    pub fn high_shelf(freq: f32, gain_db: f32, sr: f32) -> Self {
+        let a = 10f32.powf(gain_db / 40.0);
+        let w0 = TAU * freq.clamp(20.0, sr * 0.45) / sr;
+        let cos_w0 = w0.cos();
+        let sin_w0 = w0.sin();
+        let alpha = sin_w0 / 2.0 * 2.0f32.sqrt();
+        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+
+        let a0 = (a + 1.0) - (a - 1.0) * cos_w0 + two_sqrt_a_alpha;
+        Self {
+            b0: (a * ((a + 1.0) + (a - 1.0) * cos_w0 + two_sqrt_a_alpha)) / a0,
+            b1: (-2.0 * a * ((a - 1.0) + (a + 1.0) * cos_w0)) / a0,
+            b2: (a * ((a + 1.0) + (a - 1.0) * cos_w0 - two_sqrt_a_alpha)) / a0,
+            a1: (2.0 * ((a - 1.0) - (a + 1.0) * cos_w0)) / a0,
+            a2: ((a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha) / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+    pub fn peaking(freq: f32, q: f32, gain_db: f32, sr: f32) -> Self {
+        let a = 10f32.powf(gain_db / 40.0);
+        let w0 = TAU * freq.clamp(20.0, sr * 0.45) / sr;
+        let cos_w0 = w0.cos();
+        let alpha = w0.sin() / (2.0 * q.max(0.1));
+
+        let a0 = 1.0 + alpha / a;
+        Self {
+            b0: (1.0 + alpha * a) / a0,
+            b1: (-2.0 * cos_w0) / a0,
+            b2: (1.0 - alpha * a) / a0,
+            a1: (-2.0 * cos_w0) / a0,
+            a2: (1.0 - alpha / a) / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+    #[inline(always)]
     pub fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.z1;
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
@@ -102,13 +229,284 @@ impl Biquad {
     }
 }
 
+/// 3-band parametric EQ (Low Shelf, Peaking Mid, High Shelf).
+#[derive(Clone)]
+pub struct Eq3Band {
+    low: Biquad,
+    mid: Biquad,
+    high: Biquad,
+}
+impl Eq3Band {
+    pub fn new(low_gain: f32, mid_gain: f32, mid_freq: f32, mid_q: f32, high_gain: f32, sr: f32) -> Self {
+        Self {
+            low: Biquad::low_shelf(120.0, low_gain, sr),
+            mid: Biquad::peaking(mid_freq.clamp(100.0, 10000.0), mid_q.max(0.2), mid_gain, sr),
+            high: Biquad::high_shelf(6500.0, high_gain, sr),
+        }
+    }
+    pub fn process(&mut self, x: f32) -> f32 {
+        self.high.process(self.mid.process(self.low.process(x)))
+    }
+}
+
+/// Stereo Delay effect with feedback, damping, and optional ping-pong.
+#[derive(Clone)]
+pub struct StereoDelay {
+    buf_l: Vec<f32>,
+    buf_r: Vec<f32>,
+    idx_l: usize,
+    idx_r: usize,
+    delay_samples_l: usize,
+    delay_samples_r: usize,
+    feedback: f32,
+    mix: f32,
+    ping_pong: bool,
+    damp_l: f32,
+    damp_r: f32,
+}
+impl StereoDelay {
+    pub fn new(time_ms: f32, feedback: f32, mix: f32, ping_pong: bool, sr: f32) -> Self {
+        let max_samples = (2.0 * sr) as usize; // up to 2 seconds
+        let delay_samples = ((time_ms / 1000.0) * sr).clamp(1.0, max_samples as f32 - 1.0) as usize;
+        let delay_r = if ping_pong { (delay_samples * 3 / 2).min(max_samples - 1) } else { delay_samples };
+        Self {
+            buf_l: vec![0.0; max_samples],
+            buf_r: vec![0.0; max_samples],
+            idx_l: 0,
+            idx_r: 0,
+            delay_samples_l: delay_samples,
+            delay_samples_r: delay_r,
+            feedback: feedback.clamp(0.0, 0.95),
+            mix: mix.clamp(0.0, 1.0),
+            ping_pong,
+            damp_l: 0.0,
+            damp_r: 0.0,
+        }
+    }
+    pub fn process(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        let read_l = (self.idx_l + self.buf_l.len() - self.delay_samples_l) % self.buf_l.len();
+        let read_r = (self.idx_r + self.buf_r.len() - self.delay_samples_r) % self.buf_r.len();
+
+        let delayed_l = self.buf_l[read_l];
+        let delayed_r = self.buf_r[read_r];
+
+        // 6dB/oct high damping on feedback
+        self.damp_l = self.damp_l * 0.4 + delayed_l * 0.6;
+        self.damp_r = self.damp_r * 0.4 + delayed_r * 0.6;
+
+        let fb_l = if self.ping_pong { self.damp_r * self.feedback } else { self.damp_l * self.feedback };
+        let fb_r = if self.ping_pong { self.damp_l * self.feedback } else { self.damp_r * self.feedback };
+
+        self.buf_l[self.idx_l] = in_l + fb_l;
+        self.buf_r[self.idx_r] = in_r + fb_r;
+
+        self.idx_l = (self.idx_l + 1) % self.buf_l.len();
+        self.idx_r = (self.idx_r + 1) % self.buf_r.len();
+
+        let out_l = in_l * (1.0 - self.mix) + delayed_l * self.mix;
+        let out_r = in_r * (1.0 - self.mix) + delayed_r * self.mix;
+        (out_l, out_r)
+    }
+}
+
+/// Comb filter used in algorithmic reverberation.
+#[derive(Clone)]
+struct CombFilter {
+    buffer: Vec<f32>,
+    idx: usize,
+    filter_store: f32,
+    damp1: f32,
+    damp2: f32,
+    feedback: f32,
+}
+impl CombFilter {
+    fn new(size: usize) -> Self {
+        Self {
+            buffer: vec![0.0; size],
+            idx: 0,
+            filter_store: 0.0,
+            damp1: 0.5,
+            damp2: 0.5,
+            feedback: 0.8,
+        }
+    }
+    fn set_damp(&mut self, damp: f32) {
+        self.damp1 = damp;
+        self.damp2 = 1.0 - damp;
+    }
+    fn process(&mut self, input: f32) -> f32 {
+        let output = self.buffer[self.idx];
+        self.filter_store = output * self.damp2 + self.filter_store * self.damp1;
+        self.buffer[self.idx] = input + self.filter_store * self.feedback;
+        self.idx = (self.idx + 1) % self.buffer.len();
+        output
+    }
+}
+
+/// Allpass filter used in algorithmic reverberation.
+#[derive(Clone)]
+struct AllpassFilter {
+    buffer: Vec<f32>,
+    idx: usize,
+    feedback: f32,
+}
+impl AllpassFilter {
+    fn new(size: usize) -> Self {
+        Self {
+            buffer: vec![0.0; size],
+            idx: 0,
+            feedback: 0.5,
+        }
+    }
+    fn process(&mut self, input: f32) -> f32 {
+        let buf_out = self.buffer[self.idx];
+        let output = -input + buf_out;
+        self.buffer[self.idx] = input + buf_out * self.feedback;
+        self.idx = (self.idx + 1) % self.buffer.len();
+        output
+    }
+}
+
+/// Freeverb-style stereo algorithmic reverberator.
+#[derive(Clone)]
+pub struct StereoReverb {
+    combs_l: Vec<CombFilter>,
+    combs_r: Vec<CombFilter>,
+    allpasses_l: Vec<AllpassFilter>,
+    allpasses_r: Vec<AllpassFilter>,
+    gain: f32,
+    room_size: f32,
+    damping: f32,
+    width: f32,
+    mix: f32,
+}
+impl StereoReverb {
+    pub fn new(room_size: f32, damping: f32, width: f32, mix: f32, sr: f32) -> Self {
+        let scale = sr / 44100.0;
+        let comb_tunings = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
+        let allpass_tunings = [556, 441, 341, 225];
+        let stereo_spread = 23;
+
+        let combs_l = comb_tunings.iter().map(|&t| CombFilter::new((t as f32 * scale) as usize)).collect();
+        let combs_r = comb_tunings.iter().map(|&t| CombFilter::new(((t + stereo_spread) as f32 * scale) as usize)).collect();
+        let allpasses_l = allpass_tunings.iter().map(|&t| AllpassFilter::new((t as f32 * scale) as usize)).collect();
+        let allpasses_r = allpass_tunings.iter().map(|&t| AllpassFilter::new(((t + stereo_spread) as f32 * scale) as usize)).collect();
+
+        let mut rev = Self {
+            combs_l,
+            combs_r,
+            allpasses_l,
+            allpasses_r,
+            gain: 0.015,
+            room_size: room_size.clamp(0.0, 1.0),
+            damping: damping.clamp(0.0, 1.0),
+            width: width.clamp(0.0, 1.0),
+            mix: mix.clamp(0.0, 1.0),
+        };
+        rev.update_params();
+        rev
+    }
+    fn update_params(&mut self) {
+        let fb = 0.7 + self.room_size * 0.28;
+        let damp = self.damping * 0.4;
+        for c in &mut self.combs_l {
+            c.feedback = fb;
+            c.set_damp(damp);
+        }
+        for c in &mut self.combs_r {
+            c.feedback = fb;
+            c.set_damp(damp);
+        }
+    }
+    pub fn process(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        let input = (in_l + in_r) * self.gain;
+        let mut out_l = 0.0;
+        let mut out_r = 0.0;
+
+        for c in &mut self.combs_l {
+            out_l += c.process(input);
+        }
+        for c in &mut self.combs_r {
+            out_r += c.process(input);
+        }
+
+        for a in &mut self.allpasses_l {
+            out_l = a.process(out_l);
+        }
+        for a in &mut self.allpasses_r {
+            out_r = a.process(out_r);
+        }
+
+        let wet1 = 0.5 * (1.0 + self.width);
+        let wet2 = 0.5 * (1.0 - self.width);
+
+        let rev_l = out_l * wet1 + out_r * wet2;
+        let rev_r = out_r * wet1 + out_l * wet2;
+
+        let final_l = in_l * (1.0 - self.mix) + rev_l * self.mix;
+        let final_r = in_r * (1.0 - self.mix) + rev_r * self.mix;
+        (final_l, final_r)
+    }
+}
+
+/// Dynamic range compressor.
+#[derive(Clone)]
+pub struct Compressor {
+    threshold_db: f32,
+    ratio: f32,
+    attack_coeff: f32,
+    release_coeff: f32,
+    makeup_gain: f32,
+    envelope: f32,
+}
+impl Compressor {
+    pub fn new(threshold_db: f32, ratio: f32, attack_ms: f32, release_ms: f32, makeup_db: f32, sr: f32) -> Self {
+        Self {
+            threshold_db,
+            ratio: ratio.max(1.0),
+            attack_coeff: (-1.0 / ((attack_ms * 0.001 * sr).max(1.0))).exp(),
+            release_coeff: (-1.0 / ((release_ms * 0.001 * sr).max(1.0))).exp(),
+            makeup_gain: 10f32.powf(makeup_db / 20.0),
+            envelope: 0.0,
+        }
+    }
+    pub fn process(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        let max_val = in_l.abs().max(in_r.abs());
+        let coeff = if max_val > self.envelope {
+            self.attack_coeff
+        } else {
+            self.release_coeff
+        };
+        self.envelope = max_val + (self.envelope - max_val) * coeff;
+
+        let env_db = if self.envelope > 1e-6 {
+            20.0 * self.envelope.log10()
+        } else {
+            -120.0
+        };
+
+        let gain_db = if env_db > self.threshold_db {
+            (self.threshold_db - env_db) * (1.0 - 1.0 / self.ratio)
+        } else {
+            0.0
+        };
+
+        let gain = 10f32.powf(gain_db / 20.0) * self.makeup_gain;
+        (in_l * gain, in_r * gain)
+    }
+}
+
 /// xorshift white noise (deterministic, no deps).
 #[derive(Clone)]
 pub struct Noise(u32);
 impl Noise {
-    pub fn new(seed: u32) -> Self { Self(seed.max(1)) }
+    pub fn new(seed: u32) -> Self {
+        Self(seed.max(1))
+    }
     pub fn next(&mut self) -> f32 {
-        self.0 ^= self.0 << 13; self.0 ^= self.0 >> 17; self.0 ^= self.0 << 5;
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
         (self.0 as f32 / u32::MAX as f32) * 2.0 - 1.0
     }
 }
@@ -117,10 +515,30 @@ impl Noise {
 mod tests {
     use super::*;
     #[test]
-    fn a4_is_440() { assert!((midi_to_hz(69.0) - 440.0).abs() < 1e-3); }
+    fn a4_is_440() {
+        assert!((midi_to_hz(69.0) - 440.0).abs() < 1e-3);
+    }
     #[test]
     fn osc_bounded() {
         let mut o = Osc::default();
-        for _ in 0..1000 { assert!(o.saw(440.0, 44100.0).abs() <= 1.5); }
+        for _ in 0..1000 {
+            assert!(o.saw(440.0, 44100.0).abs() <= 1.5);
+        }
+    }
+    #[test]
+    fn eq_processing() {
+        let mut eq = Eq3Band::new(3.0, -2.0, 1000.0, 1.0, 4.0, 44100.0);
+        let out = eq.process(0.5);
+        assert!(out.is_finite());
+    }
+    #[test]
+    fn delay_reverb_smoke() {
+        let mut delay = StereoDelay::new(100.0, 0.5, 0.4, true, 44100.0);
+        let (dl, dr) = delay.process(0.8, 0.8);
+        assert!(dl.is_finite() && dr.is_finite());
+
+        let mut rev = StereoReverb::new(0.8, 0.3, 1.0, 0.35, 44100.0);
+        let (rl, rr) = rev.process(0.8, 0.8);
+        assert!(rl.is_finite() && rr.is_finite());
     }
 }

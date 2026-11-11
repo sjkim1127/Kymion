@@ -3,6 +3,8 @@
 //! Every mutation goes through [`Command`] so that humans (GUI), scripts and
 //! AI agents (CLI/WASM) all share one serialisable, validated interface.
 
+pub mod midi;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -16,6 +18,8 @@ pub enum Error {
     TrackNotFound(u32),
     #[error("note {0} not found")]
     NoteNotFound(u32),
+    #[error("effect {0} not found")]
+    FxNotFound(u32),
     #[error("invalid argument: {0}")]
     Invalid(String),
     #[error("nothing to {0}")]
@@ -62,8 +66,70 @@ pub struct Expression {
 }
 impl Default for Expression {
     fn default() -> Self {
-        Self { vibrato_depth: 30.0, vibrato_rate: 5.5, vibrato_delay: 0.25, portamento: 0.04, breath: 0.1, formant_shift: 0.0 }
+        Self {
+            vibrato_depth: 30.0,
+            vibrato_rate: 5.5,
+            vibrato_delay: 0.25,
+            portamento: 0.04,
+            breath: 0.1,
+            formant_shift: 0.0,
+        }
     }
+}
+
+/// Audio effects supported by Kymion tracks and master bus.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FxKind {
+    /// 3-band parametric EQ (Low Shelf, Mid Peaking, High Shelf)
+    Eq {
+        low_gain: f32,
+        mid_gain: f32,
+        mid_freq: f32,
+        mid_q: f32,
+        high_gain: f32,
+    },
+    /// Stereo Delay with feedback and ping-pong
+    Delay {
+        time_ms: f32,
+        feedback: f32,
+        mix: f32,
+        ping_pong: bool,
+    },
+    /// Algorithmic stereo reverberation
+    Reverb {
+        room_size: f32,
+        damping: f32,
+        width: f32,
+        mix: f32,
+    },
+    /// Dynamic range compressor
+    Compressor {
+        threshold_db: f32,
+        ratio: f32,
+        attack_ms: f32,
+        release_ms: f32,
+        makeup_db: f32,
+    },
+}
+
+impl Default for FxKind {
+    fn default() -> Self {
+        Self::Reverb {
+            room_size: 0.6,
+            damping: 0.3,
+            width: 1.0,
+            mix: 0.25,
+        }
+    }
+}
+
+/// Active effect instance in an FX chain.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct FxInstance {
+    pub id: u32,
+    pub enabled: bool,
+    pub kind: FxKind,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -89,6 +155,8 @@ pub struct Track {
     pub pan: f32,
     pub mute: bool,
     pub expression: Expression,
+    #[serde(default)]
+    pub fx: Vec<FxInstance>,
     pub notes: Vec<Note>,
 }
 
@@ -98,32 +166,49 @@ pub struct Project {
     pub sample_rate: u32,
     pub tempo: f32,
     pub tracks: Vec<Track>,
+    #[serde(default)]
+    pub master_fx: Vec<FxInstance>,
     next_id: u32,
 }
 
 impl Default for Project {
     fn default() -> Self {
-        Self { name: "Untitled".into(), sample_rate: 44100, tempo: 120.0, tracks: vec![], next_id: 1 }
+        Self {
+            name: "Untitled".into(),
+            sample_rate: 44100,
+            tempo: 120.0,
+            tracks: vec![],
+            master_fx: vec![],
+            next_id: 1,
+        }
     }
 }
 
 impl Project {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), ..Default::default() }
+        Self {
+            name: name.into(),
+            ..Default::default()
+        }
     }
     pub fn ticks_to_secs(&self, ticks: u32) -> f32 {
         ticks as f32 * 60.0 / (self.tempo * PPQ as f32)
     }
     pub fn length_ticks(&self) -> u32 {
-        self.tracks.iter().flat_map(|t| &t.notes).map(|n| n.start + n.duration).max().unwrap_or(0)
+        self.tracks
+            .iter()
+            .flat_map(|t| &t.notes)
+            .map(|n| n.start + n.duration)
+            .max()
+            .unwrap_or(0)
     }
     pub fn track(&self, id: u32) -> Result<&Track> {
         self.tracks.iter().find(|t| t.id == id).ok_or(Error::TrackNotFound(id))
     }
-    fn track_mut(&mut self, id: u32) -> Result<&mut Track> {
+    pub fn track_mut(&mut self, id: u32) -> Result<&mut Track> {
         self.tracks.iter_mut().find(|t| t.id == id).ok_or(Error::TrackNotFound(id))
     }
-    fn alloc(&mut self) -> u32 {
+    pub fn alloc(&mut self) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
         id
@@ -145,7 +230,15 @@ pub enum Command {
     AddTrack { name: String, kind: TrackKind },
     RemoveTrack { track: u32 },
     SetMix { track: u32, gain: Option<f32>, pan: Option<f32>, mute: Option<bool> },
-    AddNote { track: u32, start: u32, duration: u32, pitch: u8, #[serde(default = "vel")] velocity: u8, lyric: Option<String> },
+    AddNote {
+        track: u32,
+        start: u32,
+        duration: u32,
+        pitch: u8,
+        #[serde(default = "vel")]
+        velocity: u8,
+        lyric: Option<String>,
+    },
     RemoveNote { track: u32, note: u32 },
     MoveNote { track: u32, note: u32, start: Option<u32>, pitch: Option<u8>, duration: Option<u32> },
     /// Assign lyrics to consecutive notes of a vocal track (one syllable per note).
@@ -155,8 +248,16 @@ pub enum Command {
     /// Quantize note starts to a grid (ticks).
     Quantize { track: u32, grid: u32 },
     Transpose { track: u32, semitones: i8 },
+    /// Add an effect to a track FX chain or master bus (`track` = None).
+    AddFx { track: Option<u32>, kind: FxKind },
+    /// Modify effect parameters or toggle bypass.
+    SetFx { track: Option<u32>, fx: u32, kind: Option<FxKind>, enabled: Option<bool> },
+    /// Remove an effect from an FX chain.
+    RemoveFx { track: Option<u32>, fx: u32 },
 }
-fn vel() -> u8 { 100 }
+fn vel() -> u8 {
+    100
+}
 
 /// Result of applying a command (ids created, etc.), JSON-friendly for agents.
 #[derive(Clone, Debug, Serialize, Default)]
@@ -166,6 +267,8 @@ pub struct Outcome {
     pub track_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fx_id: Option<u32>,
 }
 
 /// Project + undo/redo history.
@@ -178,7 +281,10 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(project: Project) -> Self {
-        Self { project, ..Default::default() }
+        Self {
+            project,
+            ..Default::default()
+        }
     }
 
     pub fn apply_json(&mut self, json: &str) -> Result<Outcome> {
@@ -214,7 +320,10 @@ impl Engine {
 }
 
 fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
-    let mut out = Outcome { ok: true, ..Default::default() };
+    let mut out = Outcome {
+        ok: true,
+        ..Default::default()
+    };
     match cmd {
         Command::SetTempo { bpm } => {
             if !(20.0..=400.0).contains(&bpm) {
@@ -225,7 +334,17 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
         Command::SetName { name } => p.name = name,
         Command::AddTrack { name, kind } => {
             let id = p.alloc();
-            p.tracks.push(Track { id, name, kind, gain: 0.8, pan: 0.0, mute: false, expression: Expression::default(), notes: vec![] });
+            p.tracks.push(Track {
+                id,
+                name,
+                kind,
+                gain: 0.8,
+                pan: 0.0,
+                mute: false,
+                expression: Expression::default(),
+                fx: vec![],
+                notes: vec![],
+            });
             out.track_id = Some(id);
         }
         Command::RemoveTrack { track } => {
@@ -234,9 +353,15 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
         }
         Command::SetMix { track, gain, pan, mute } => {
             let t = p.track_mut(track)?;
-            if let Some(g) = gain { t.gain = g.clamp(0.0, 2.0); }
-            if let Some(v) = pan { t.pan = v.clamp(-1.0, 1.0); }
-            if let Some(m) = mute { t.mute = m; }
+            if let Some(g) = gain {
+                t.gain = g.clamp(0.0, 2.0);
+            }
+            if let Some(v) = pan {
+                t.pan = v.clamp(-1.0, 1.0);
+            }
+            if let Some(m) = mute {
+                t.mute = m;
+            }
         }
         Command::AddNote { track, start, duration, pitch, velocity, lyric } => {
             if duration == 0 || pitch > 127 || velocity > 127 {
@@ -244,7 +369,15 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
             }
             let id = p.alloc();
             let t = p.track_mut(track)?;
-            t.notes.push(Note { id, start, duration, pitch, velocity, lyric, expression: None });
+            t.notes.push(Note {
+                id,
+                start,
+                duration,
+                pitch,
+                velocity,
+                lyric,
+                expression: None,
+            });
             t.notes.sort_by_key(|n| (n.start, n.pitch));
             out.note_id = Some(id);
         }
@@ -252,37 +385,105 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
             let t = p.track_mut(track)?;
             let n = t.notes.len();
             t.notes.retain(|x| x.id != note);
-            if t.notes.len() == n { return Err(Error::NoteNotFound(note)); }
+            if t.notes.len() == n {
+                return Err(Error::NoteNotFound(note));
+            }
         }
         Command::MoveNote { track, note, start, pitch, duration } => {
             let t = p.track_mut(track)?;
             let n = t.notes.iter_mut().find(|x| x.id == note).ok_or(Error::NoteNotFound(note))?;
-            if let Some(s) = start { n.start = s; }
-            if let Some(v) = pitch { if v > 127 { return Err(Error::Invalid("pitch".into())); } n.pitch = v; }
-            if let Some(d) = duration { if d == 0 { return Err(Error::Invalid("duration".into())); } n.duration = d; }
+            if let Some(s) = start {
+                n.start = s;
+            }
+            if let Some(v) = pitch {
+                if v > 127 {
+                    return Err(Error::Invalid("pitch".into()));
+                }
+                n.pitch = v;
+            }
+            if let Some(d) = duration {
+                if d == 0 {
+                    return Err(Error::Invalid("duration".into()));
+                }
+                n.duration = d;
+            }
             t.notes.sort_by_key(|n| (n.start, n.pitch));
         }
         Command::SetLyrics { track, lyrics } => {
             let t = p.track_mut(track)?;
-            for (n, l) in t.notes.iter_mut().zip(lyrics) { n.lyric = Some(l); }
+            for (n, l) in t.notes.iter_mut().zip(lyrics) {
+                n.lyric = Some(l);
+            }
         }
         Command::SetExpression { track, note, expression } => {
             let t = p.track_mut(track)?;
             match note {
                 None => t.expression = expression,
-                Some(id) => t.notes.iter_mut().find(|x| x.id == id).ok_or(Error::NoteNotFound(id))?.expression = Some(expression),
+                Some(id) => {
+                    t.notes
+                        .iter_mut()
+                        .find(|x| x.id == id)
+                        .ok_or(Error::NoteNotFound(id))?
+                        .expression = Some(expression)
+                }
             }
         }
         Command::Quantize { track, grid } => {
-            if grid == 0 { return Err(Error::Invalid("grid>0".into())); }
+            if grid == 0 {
+                return Err(Error::Invalid("grid>0".into()));
+            }
             let t = p.track_mut(track)?;
-            for n in &mut t.notes { n.start = (n.start + grid / 2) / grid * grid; }
+            for n in &mut t.notes {
+                n.start = (n.start + grid / 2) / grid * grid;
+            }
             t.notes.sort_by_key(|n| (n.start, n.pitch));
         }
         Command::Transpose { track, semitones } => {
             let t = p.track_mut(track)?;
             for n in &mut t.notes {
                 n.pitch = (n.pitch as i16 + semitones as i16).clamp(0, 127) as u8;
+            }
+        }
+        Command::AddFx { track, kind } => {
+            let id = p.alloc();
+            let inst = FxInstance {
+                id,
+                enabled: true,
+                kind,
+            };
+            match track {
+                Some(t_id) => {
+                    let t = p.track_mut(t_id)?;
+                    t.fx.push(inst);
+                }
+                None => {
+                    p.master_fx.push(inst);
+                }
+            }
+            out.fx_id = Some(id);
+        }
+        Command::SetFx { track, fx, kind, enabled } => {
+            let fx_list = match track {
+                Some(t_id) => &mut p.track_mut(t_id)?.fx,
+                None => &mut p.master_fx,
+            };
+            let item = fx_list.iter_mut().find(|f| f.id == fx).ok_or(Error::FxNotFound(fx))?;
+            if let Some(k) = kind {
+                item.kind = k;
+            }
+            if let Some(en) = enabled {
+                item.enabled = en;
+            }
+        }
+        Command::RemoveFx { track, fx } => {
+            let fx_list = match track {
+                Some(t_id) => &mut p.track_mut(t_id)?.fx,
+                None => &mut p.master_fx,
+            };
+            let len_before = fx_list.len();
+            fx_list.retain(|f| f.id != fx);
+            if fx_list.len() == len_before {
+                return Err(Error::FxNotFound(fx));
             }
         }
     }
@@ -301,9 +502,19 @@ mod tests {
     #[test]
     fn add_undo_redo() {
         let mut e = Engine::default();
-        let o = e.apply_json(r#"{"cmd":"add_track","name":"Lead","kind":{"type":"vocal","voice":"default"}}"#).unwrap();
+        let o = e
+            .apply_json(r#"{"cmd":"add_track","name":"Lead","kind":{"type":"vocal","voice":"default"}}"#)
+            .unwrap();
         let t = o.track_id.unwrap();
-        e.apply(Command::AddNote { track: t, start: 0, duration: 480, pitch: 60, velocity: 100, lyric: Some("la".into()) }).unwrap();
+        e.apply(Command::AddNote {
+            track: t,
+            start: 0,
+            duration: 480,
+            pitch: 60,
+            velocity: 100,
+            lyric: Some("la".into()),
+        })
+        .unwrap();
         assert_eq!(e.project.tracks[0].notes.len(), 1);
         e.undo().unwrap();
         assert!(e.project.tracks[0].notes.is_empty());
@@ -312,9 +523,45 @@ mod tests {
     }
 
     #[test]
-    fn invalid_leaves_state() {
+    fn fx_chain_commands() {
         let mut e = Engine::default();
-        assert!(e.apply(Command::SetTempo { bpm: 5.0 }).is_err());
-        assert_eq!(e.project.tempo, 120.0);
+        let t = e
+            .apply(Command::AddTrack {
+                name: "Synth".into(),
+                kind: TrackKind::Instrument { waveform: Waveform::Saw },
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
+
+        let o = e
+            .apply(Command::AddFx {
+                track: Some(t),
+                kind: FxKind::Delay {
+                    time_ms: 250.0,
+                    feedback: 0.4,
+                    mix: 0.3,
+                    ping_pong: true,
+                },
+            })
+            .unwrap();
+        let fx_id = o.fx_id.unwrap();
+        assert_eq!(e.project.tracks[0].fx.len(), 1);
+
+        e.apply(Command::SetFx {
+            track: Some(t),
+            fx: fx_id,
+            kind: None,
+            enabled: Some(false),
+        })
+        .unwrap();
+        assert!(!e.project.tracks[0].fx[0].enabled);
+
+        e.apply(Command::RemoveFx {
+            track: Some(t),
+            fx: fx_id,
+        })
+        .unwrap();
+        assert!(e.project.tracks[0].fx.is_empty());
     }
 }

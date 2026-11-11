@@ -1,28 +1,35 @@
-# Kymion architecture (v0.1 draft)
+# Kymion architecture (v0.2)
 
 ```
-            ┌────────────┐   ┌────────────┐
- AI agent ─▶│ kymion CLI │   │ Web GUI    │◀─ human
-            └─────┬──────┘   │ (WASM+JS)  │
-                  │          └─────┬──────┘
-                  ▼                ▼
-             kymion-core  (Project, Command, Engine + undo/redo, JSON Schema)
-                  │
-         kymion-audio (renderer, mixer, analysis, WAV)
-            │                 │
-      kymion-vocal        kymion-dsp
-  (lyric→phoneme, pitch   (osc, ADSR, biquad, noise)
-   curves, Voice trait)
+            ┌──────────────────┐   ┌──────────────────────────┐
+ AI agent ─▶│    kymion CLI    │   │         Web GUI          │◀─ human / producer
+            │ (JSON in/out/mid)│   │(WASM + PianoRoll + FX UI)│
+            └────────┬─────────┘   └────────────┬─────────────┘
+                     │                          │
+                     ▼                          ▼
+             kymion-core (Project, Command, Engine + undo/redo, SMF MIDI I/O)
+                     │
+             kymion-audio (offline renderer, multi-track mixer, FX chain)
+               │          │
+         kymion-vocal     kymion-dsp (Osc, ADSR, 3-band EQ, Delay, Reverb, Comp)
+   (lyric→phoneme, pitch
+    curves, Voice trait)
 ```
 
-## Principles
-- **One mutation path**: every edit is a serialisable `Command`; GUI, CLI and WASM share it. Undo/redo is snapshot-based (simple, correct; switch to inverse-ops when projects get large).
-- **Deterministic, offline rendering** so agents can render + `analyze` and iterate without audio hardware.
-- **Pure Rust, no native deps in core** → identical code compiles to `wasm32-unknown-unknown`.
-- **Vocal backend seam**: `kymion_vocal::Voice` trait. v0.1 ships a rule-based formant synthesizer; voicebank (concatenative, UTAU-style) and neural backends plug in here.
+## Core Principles
+- **Logic / Cubase DAW Model**: Multi-track composition, standard MIDI file interop, track insert effects, and master bus summing.
+- **Single mutation path**: Every edit (tracks, notes, lyrics, mix, FX) is a serialisable `Command`. GUI, CLI and AI agents share 100% identical state mutations.
+- **Deterministic, offline rendering**: AI agents can generate arrangements, tweak EQ/Reverb, and run `analyze` to verify peak, RMS, and clipping metrics without needing an audio output device.
+- **Pure Rust, no native C dependencies**: Compiles cleanly to both native CLI and `wasm32-unknown-unknown` for zero-install in-browser production.
+- **Pluggable Vocal Engine**: `kymion_vocal::Voice` trait allows swapping the current rule-based formant synth with sample-based voicebanks or neural vocoders.
 
-## Roadmap
-1. MIDI import/export, audio clip tracks, tempo/time-signature maps.
-2. Effects chain (EQ, comp, reverb, delay) + automation lanes; AudioWorklet realtime playback.
-3. Vocal: pitch-curve editing (hand-drawn bends), phoneme timing editor, voicebank loader, neural vocoder backend.
-4. Agent tooling: MCP server wrapping the CLI; `diff`/`explain` commands; score→text summaries.
+## Signal Flow
+1. **Track Synth / Vocal**:
+   - `Instrument` -> PolyBLEP Osc -> ADSR envelope.
+   - `Vocal` -> Lyric-to-phoneme -> Glottal pulse + Noise -> Formant biquad resonators -> Vibrato/Portamento.
+2. **Track FX Chain**:
+   - 3-band Parametric EQ -> Stereo Ping-Pong Delay -> Algorithmic Reverb -> Compressor.
+3. **Mixer Bus**:
+   - Equal-power panning -> Track gain -> Master summing.
+4. **Master Bus**:
+   - Master EQ -> Master Compressor / Bus Processor -> Soft Limiter (`tanh`).
