@@ -3,3 +3,7 @@ web/pkg
 *.wav
 !examples/*.wav
 .DS_Store
+
+# reference-only third-party snapshots (see vendor/README.md)
+vendor/*
+!vendor/README.md
