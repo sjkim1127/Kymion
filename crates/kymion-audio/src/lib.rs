@@ -20,11 +20,8 @@ pub struct Analysis {
     pub clipped_samples: usize,
 }
 
-fn render_instrument(p: &Project, t: &Track, wf: Waveform, sr: u32) -> Vec<f32> {
+fn render_instrument_into(p: &Project, t: &Track, wf: Waveform, sr: u32, buf: &mut [f32]) {
     let srf = sr as f32;
-    // Base length + 2 seconds release/decay room
-    let total = (p.ticks_to_secs(p.length_ticks()) * srf) as usize + sr as usize * 2;
-    let mut buf = vec![0f32; total];
     for n in &t.notes {
         let dur = p.ticks_to_secs(n.duration);
         let len = ((dur + 0.35) * srf) as usize;
@@ -36,7 +33,9 @@ fn render_instrument(p: &Project, t: &Track, wf: Waveform, sr: u32) -> Vec<f32> 
             _ => Adsr::new(0.01, 0.1, 0.7, 0.25, srf),
         };
         let vel = n.velocity as f32 / 127.0;
-        for i in 0..len {
+        let note_end = (off + len).min(buf.len());
+        let count = note_end.saturating_sub(off);
+        for i in 0..count {
             if i as f32 / srf >= dur {
                 env.gate_off();
             }
@@ -47,12 +46,9 @@ fn render_instrument(p: &Project, t: &Track, wf: Waveform, sr: u32) -> Vec<f32> 
                 Waveform::Triangle => osc.triangle(hz, srf),
                 Waveform::Pluck => osc.saw(hz, srf) * 0.5,
             };
-            if let Some(b) = buf.get_mut(off + i) {
-                *b += s * env.next() * vel * 0.5;
-            }
+            buf[off + i] += s * env.next() * vel * 0.5;
         }
     }
-    buf
 }
 
 /// Apply an FX chain to in-place stereo buffers.
@@ -129,8 +125,7 @@ pub struct RenderOptions {
 
 /// Mono audio track: place every clip's asset (linear-resampled) on the timeline,
 /// respecting clip start, asset offset (start trim), duration (end trim), gain, and fades.
-fn render_audio_track(p: &Project, t: &Track, sr: u32, total: usize) -> Vec<f32> {
-    let mut buf = vec![0f32; total];
+fn render_audio_track_into(p: &Project, t: &Track, sr: u32, buf: &mut [f32]) {
     for clip in &t.clips {
         let Some(asset) = p.assets.iter().find(|a| a.id == clip.asset) else { continue };
         let data = asset.samples();
@@ -148,7 +143,9 @@ fn render_audio_track(p: &Project, t: &Track, sr: u32, total: usize) -> Vec<f32>
         let fade_in_samples = (p.ticks_to_secs(clip.fade_in_ticks) * sr as f32) as usize;
         let fade_out_samples = (p.ticks_to_secs(clip.fade_out_ticks) * sr as f32) as usize;
 
-        for i in 0..out_len {
+        let max_samples = out_len.min(buf.len().saturating_sub(off));
+
+        for i in 0..max_samples {
             let pos = asset_offset_samples as f32 + i as f32 * ratio;
             if pos >= data.len() as f32 {
                 break;
@@ -168,12 +165,9 @@ fn render_audio_track(p: &Project, t: &Track, sr: u32, total: usize) -> Vec<f32>
                 fade = fade.min(rem as f32 / fade_out_samples as f32);
             }
 
-            if let Some(o) = buf.get_mut(off + i) {
-                *o += raw_sample * clip.gain * fade;
-            }
+            buf[off + i] += raw_sample * clip.gain * fade;
         }
     }
-    buf
 }
 
 fn add_metronome(p: &Project, l: &mut [f32], r: &mut [f32], sr: u32) {
@@ -219,17 +213,66 @@ pub struct ProjectMeters {
     pub tracks: std::collections::BTreeMap<u32, Meter>,
 }
 
+pub const METER_BLOCK_SIZE: usize = 256;
+
 #[derive(Clone, Debug)]
-pub struct TrackAudio {
+pub struct TrackMeterEnvelope {
     pub id: u32,
-    pub left: Vec<f32>,
-    pub right: Vec<f32>,
+    pub peaks: Vec<f32>,
+    pub rms: Vec<f32>,
+}
+
+impl TrackMeterEnvelope {
+    pub fn from_audio(id: u32, left: &[f32], right: &[f32]) -> Self {
+        let n = left.len().min(right.len());
+        let num_blocks = (n + METER_BLOCK_SIZE - 1) / METER_BLOCK_SIZE;
+        let mut peaks = Vec::with_capacity(num_blocks);
+        let mut rms = Vec::with_capacity(num_blocks);
+
+        for blk in 0..num_blocks {
+            let start = blk * METER_BLOCK_SIZE;
+            let end = (start + METER_BLOCK_SIZE).min(n);
+            let mut p = 0.0f32;
+            let mut sum_sq = 0.0f64;
+            let count = end - start;
+            for i in start..end {
+                let l = left[i].abs();
+                let r = right[i].abs();
+                p = p.max(l).max(r);
+                sum_sq += (l as f64) * (l as f64) + (r as f64) * (r as f64);
+            }
+            peaks.push(p);
+            rms.push((sum_sq / (2 * count).max(1) as f64).sqrt() as f32);
+        }
+
+        Self { id, peaks, rms }
+    }
+
+    #[inline]
+    pub fn meter_at(&self, start: usize, len: usize) -> Meter {
+        let start_blk = start / METER_BLOCK_SIZE;
+        let end_blk = ((start + len + METER_BLOCK_SIZE - 1) / METER_BLOCK_SIZE).min(self.peaks.len());
+        if start_blk >= self.peaks.len() || start_blk >= end_blk {
+            return Meter::default();
+        }
+        let mut p = 0.0f32;
+        let mut sum_sq = 0.0f64;
+        let count = end_blk - start_blk;
+        for i in start_blk..end_blk {
+            p = p.max(self.peaks[i]);
+            sum_sq += (self.rms[i] as f64) * (self.rms[i] as f64);
+        }
+        Meter {
+            peak: p,
+            rms: (sum_sq / count as f64).sqrt() as f32,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct FullRender {
     pub master: Stereo,
-    pub tracks: Vec<TrackAudio>,
+    pub track_meters: Vec<TrackMeterEnvelope>,
 }
 
 pub fn calc_meter_channel(samples: &[f32], start: usize, len: usize) -> Meter {
@@ -258,16 +301,8 @@ impl FullRender {
         let ml = calc_meter_channel(&self.master.left, start, len);
         let mr = calc_meter_channel(&self.master.right, start, len);
         let mut tracks = std::collections::BTreeMap::new();
-        for t in &self.tracks {
-            let tl = calc_meter_channel(&t.left, start, len);
-            let tr = calc_meter_channel(&t.right, start, len);
-            tracks.insert(
-                t.id,
-                Meter {
-                    peak: tl.peak.max(tr.peak),
-                    rms: ((tl.rms * tl.rms + tr.rms * tr.rms) * 0.5).sqrt(),
-                },
-            );
+        for t in &self.track_meters {
+            tracks.insert(t.id, t.meter_at(start, len));
         }
         ProjectMeters {
             master: StereoMeter { left: ml, right: mr },
@@ -293,19 +328,30 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
 
     let mut master_l: Vec<f32> = vec![0.0; total_samples];
     let mut master_r: Vec<f32> = vec![0.0; total_samples];
-    let mut rendered_tracks: Vec<TrackAudio> = Vec::new();
+
+    // Reusable scratch buffers to eliminate per-track allocations
+    let mut mono: Vec<f32> = vec![0.0; total_samples];
+    let mut trk_l: Vec<f32> = vec![0.0; total_samples];
+    let mut trk_r: Vec<f32> = vec![0.0; total_samples];
+
+    let mut track_meters: Vec<TrackMeterEnvelope> = Vec::new();
     let any_solo = p.tracks.iter().any(|t| t.solo);
     let ticks_per_sample = p.tempo * PPQ as f32 / 60.0 / srf;
 
     for t in p.tracks.iter().filter(|t| !t.mute && (!any_solo || t.solo)) {
-        let mono = match &t.kind {
-            TrackKind::Instrument { waveform } => render_instrument(p, t, *waveform, sr),
-            TrackKind::Vocal { .. } => render_vocal(p, t, &FormantVoice, sr),
-            TrackKind::Audio => render_audio_track(p, t, sr, total_samples),
+        mono.fill(0.0);
+        match &t.kind {
+            TrackKind::Instrument { waveform } => render_instrument_into(p, t, *waveform, sr, &mut mono),
+            TrackKind::Vocal { .. } => {
+                let v = render_vocal(p, t, &FormantVoice, sr);
+                let copy_len = v.len().min(total_samples);
+                mono[..copy_len].copy_from_slice(&v[..copy_len]);
+            }
+            TrackKind::Audio => render_audio_track_into(p, t, sr, &mut mono),
         };
 
-        let mut trk_l = vec![0.0; total_samples];
-        let mut trk_r = vec![0.0; total_samples];
+        trk_l.fill(0.0);
+        trk_r.fill(0.0);
 
         let static_pan = {
             let a = (t.pan + 1.0) * std::f32::consts::FRAC_PI_4;
@@ -313,10 +359,8 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
         };
         let automated = !t.gain_auto.is_empty() || !t.pan_auto.is_empty();
 
-        for (i, &s) in mono.iter().enumerate() {
-            if i >= total_samples {
-                break;
-            }
+        for i in 0..total_samples {
+            let s = mono[i];
             let (gain, (pl, pr)) = if automated {
                 let tick = i as f32 * ticks_per_sample;
                 let g = eval_auto(&t.gain_auto, tick, t.gain);
@@ -338,11 +382,7 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
             master_r[i] += trk_r[i];
         }
 
-        rendered_tracks.push(TrackAudio {
-            id: t.id,
-            left: trk_l,
-            right: trk_r,
-        });
+        track_meters.push(TrackMeterEnvelope::from_audio(t.id, &trk_l, &trk_r));
     }
 
     // Apply master bus FX chain
@@ -359,7 +399,7 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
 
     FullRender {
         master: Stereo { sample_rate: sr, left: master_l, right: master_r },
-        tracks: rendered_tracks,
+        track_meters,
     }
 }
 
@@ -526,7 +566,7 @@ mod tests {
         e.apply(Command::SetClipFade { track: tr, clip: cl, fade_in_ticks: Some(480), fade_out_ticks: Some(480) }).unwrap();
 
         let full = render_full(&e.project, &RenderOptions::default());
-        assert_eq!(full.tracks.len(), 1);
+        assert_eq!(full.track_meters.len(), 1);
         let m = full.meters_at(0, 100);
         // Start of fade-in is near 0
         assert!(m.master.left.peak < 0.05);

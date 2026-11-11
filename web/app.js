@@ -91,9 +91,40 @@ function refresh() {
 }
 
 const panText = (p) => (p === 0 ? "C" : p < 0 ? `L${Math.round(-p * 100)}` : `R${Math.round(p * 100)}`);
+let renderedTrackKey = "";
 
 function renderTracks() {
   const box = $("tracks");
+  const trackKey = P.tracks.map((t) => t.id).join(",");
+
+  if (trackKey === renderedTrackKey && box.children.length === P.tracks.length) {
+    // Fast path: in-place DOM update (avoids layout thrashing and GC overhead)
+    P.tracks.forEach((t, i) => {
+      const d = box.children[i];
+      if (!d) return;
+      d.className = "trk" + (t.id === sel ? " sel" : "");
+      const icon = t.kind.type === "vocal" ? "🎤" : t.kind.type === "audio" ? "🔊" : "🎹";
+      const nameEl = d.querySelector(".tname");
+      if (nameEl) nameEl.textContent = `${icon} ${t.name}${t.fx.length ? ` [${t.fx.length} FX]` : ""}`;
+
+      const muteBtn = d.querySelector('[data-a="mute"]');
+      if (muteBtn) muteBtn.className = "ms " + (t.mute ? "on-mute" : "");
+
+      const soloBtn = d.querySelector('[data-a="solo"]');
+      if (soloBtn) soloBtn.className = "ms " + (t.solo ? "on-solo" : "");
+
+      const vol = d.querySelector(".vol-slider");
+      if (vol && document.activeElement !== vol) vol.value = t.gain;
+
+      const pan = d.querySelector(".pan-slider");
+      const panLbl = d.querySelector(".pan-lbl");
+      if (pan && document.activeElement !== pan) pan.value = t.pan;
+      if (panLbl) panLbl.textContent = panText(t.pan);
+    });
+    return;
+  }
+
+  renderedTrackKey = trackKey;
   box.innerHTML = "";
   for (const t of P.tracks) {
     const icon = t.kind.type === "vocal" ? "🎤" : t.kind.type === "audio" ? "🔊" : "🎹";
