@@ -17,7 +17,8 @@ Shallow snapshots of open-source DAWs / singing-voice tools, kept **only for rea
 | `audacity` | https://github.com/audacity/audacity | GPL-2.0+ | audio editing, project model, effects |
 | `tracktion_engine` | https://github.com/tracktion/tracktion_engine | GPL/commercial | DAW engine design (edit/track/clip model) |
 | `helio-workstation` | https://github.com/helio-fm/helio-workstation | GPL-3.0 | sequencer UX, MIDI editing |
-| `Meadowlark` | https://github.com/MeadowlarkDAW/Meadowlark | GPL-3.0 | Rust DAW design (closest to Kymion's stack) |
+| `maolan` | https://github.com/maolan/maolan | BSD-2-Clause | Rust DAW (closest to Kymion's stack) |
+| `generic-daw` | https://github.com/generic-daw/generic-daw | GPL-3.0 | Rust DAW, timeline/audio-graph design |
 
 Snapshots are `--depth 1`; `.git` was removed. Re-fetch with:
 `git clone --depth 1 <url> vendor/<dir>`
