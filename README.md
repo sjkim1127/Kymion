@@ -5,10 +5,11 @@
 Professional music editing DAW + audio engine + vocaloid-style vocal tuning, written in Rust.
 **Web GUI runs in the browser via WASM** (no desktop GUI required), and an **agent-first JSON CLI** drives the exact same engine.
 
-> Status: v0.2 Audio Engine & DAW Core. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [AGENTS.md](AGENTS.md).
+> Status: v0.3 basic DAW features. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [AGENTS.md](AGENTS.md).
 
 ## Features
-- **DAW Core**: Multi-track timeline, 480 PPQ MIDI precision, mixer with pan/gain/mute.
+- **DAW Core**: Multi-track timeline (MIDI, vocal and audio tracks), 480 PPQ precision, mixer with gain/pan/mute/solo, volume & pan automation, time signatures, loop region, metronome, WAV audio clips.
+- **Web DAW GUI**: arrangement view + piano roll, bar/beat ruler, playhead & loop playback, draw/select tools, multi-select move/resize, copy/paste/duplicate/split, velocity lane, zoom/scroll, undo/redo shortcuts.
 - **Standard MIDI Interop**: Lossless `.mid` import & export with tempo map and lyric synchronization.
 - **DSP Effect Chains**: Track insert FX and master bus chain with 3-band parametric EQ, Stereo Ping-Pong Delay, Algorithmic Reverb, and Dynamic Range Compressor.
 - **Vocaloid-Style Vocal Tuning**: Lyric-to-phoneme parsing (Hangul / Kana / Latin), formant singing synthesis, vibrato delay/depth/rate, portamento glide, breathiness, and gender formant shift.

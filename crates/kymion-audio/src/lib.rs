@@ -1,6 +1,6 @@
 //! Kymion audio engine: offline renderer, mixer, DSP effects chain, analysis, WAV export.
 
-use kymion_core::{FxInstance, FxKind, Project, Track, TrackKind, Waveform};
+use kymion_core::{eval_auto, FxInstance, FxKind, Project, Track, TrackKind, Waveform, PPQ};
 use kymion_dsp::{midi_to_hz, Adsr, Compressor, Eq3Band, Osc, StereoDelay, StereoReverb};
 use kymion_vocal::{render_track as render_vocal, FormantVoice};
 use serde::Serialize;
@@ -121,8 +121,69 @@ pub fn apply_fx_chain(left: &mut [f32], right: &mut [f32], fx_list: &[FxInstance
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct RenderOptions {
+    /// Mix a click track (accented downbeat) into the master output.
+    pub metronome: bool,
+}
+
+/// Mono audio track: place every clip's asset (linear-resampled) on the timeline.
+fn render_audio_track(p: &Project, t: &Track, sr: u32, total: usize) -> Vec<f32> {
+    let mut buf = vec![0f32; total];
+    for clip in &t.clips {
+        let Some(asset) = p.assets.iter().find(|a| a.id == clip.asset) else { continue };
+        let data = asset.samples();
+        if data.is_empty() {
+            continue;
+        }
+        let ratio = asset.sample_rate as f32 / sr as f32;
+        let off = (p.ticks_to_secs(clip.start) * sr as f32) as usize;
+        let out_len = (data.len() as f32 / ratio) as usize;
+        for i in 0..out_len {
+            let pos = i as f32 * ratio;
+            let k = pos as usize;
+            let frac = pos - k as f32;
+            let a = data[k.min(data.len() - 1)];
+            let b = data[(k + 1).min(data.len() - 1)];
+            if let Some(o) = buf.get_mut(off + i) {
+                *o += (a + (b - a) * frac) * clip.gain;
+            }
+        }
+    }
+    buf
+}
+
+fn add_metronome(p: &Project, l: &mut [f32], r: &mut [f32], sr: u32) {
+    let srf = sr as f32;
+    let beat = p.beat_ticks();
+    let blip = (0.04 * srf) as usize;
+    let mut b = 0u32;
+    loop {
+        let tick = b * beat;
+        let start = (p.ticks_to_secs(tick) * srf) as usize;
+        if start >= l.len() || tick > p.length_ticks() + p.bar_ticks() {
+            break;
+        }
+        let down = b % p.time_sig_num.max(1) as u32 == 0;
+        let hz = if down { 1500.0 } else { 1000.0 };
+        for i in 0..blip {
+            let env = (-(i as f32) / (0.01 * srf)).exp();
+            let v = (std::f32::consts::TAU * hz * i as f32 / srf).sin() * env * 0.3;
+            if let (Some(a), Some(c)) = (l.get_mut(start + i), r.get_mut(start + i)) {
+                *a += v;
+                *c += v;
+            }
+        }
+        b += 1;
+    }
+}
+
 /// Render the whole project to stereo including track and master FX chains.
 pub fn render(p: &Project) -> Stereo {
+    render_with(p, &RenderOptions::default())
+}
+
+pub fn render_with(p: &Project, opts: &RenderOptions) -> Stereo {
     let sr = p.sample_rate;
     let srf = sr as f32;
     // Tail room for delays/reverbs (extra 2 seconds)
@@ -130,31 +191,45 @@ pub fn render(p: &Project) -> Stereo {
 
     let mut master_l: Vec<f32> = vec![0.0; total_samples];
     let mut master_r: Vec<f32> = vec![0.0; total_samples];
+    let any_solo = p.tracks.iter().any(|t| t.solo);
+    let ticks_per_sample = p.tempo * PPQ as f32 / 60.0 / srf;
 
-    for t in p.tracks.iter().filter(|t| !t.mute) {
+    for t in p.tracks.iter().filter(|t| !t.mute && (!any_solo || t.solo)) {
         let mono = match &t.kind {
             TrackKind::Instrument { waveform } => render_instrument(p, t, *waveform, sr),
             TrackKind::Vocal { .. } => render_vocal(p, t, &FormantVoice, sr),
+            TrackKind::Audio => render_audio_track(p, t, sr, total_samples),
         };
 
         let mut trk_l = vec![0.0; total_samples];
         let mut trk_r = vec![0.0; total_samples];
 
-        // Equal-power pan
-        let a = (t.pan + 1.0) * std::f32::consts::FRAC_PI_4;
-        let (gl, gr) = (a.cos() * t.gain, a.sin() * t.gain);
+        let static_pan = {
+            let a = (t.pan + 1.0) * std::f32::consts::FRAC_PI_4;
+            (a.cos(), a.sin())
+        };
+        let automated = !t.gain_auto.is_empty() || !t.pan_auto.is_empty();
 
         for (i, &s) in mono.iter().enumerate() {
-            if i < total_samples {
-                trk_l[i] = s * gl;
-                trk_r[i] = s * gr;
+            if i >= total_samples {
+                break;
             }
+            let (gain, (pl, pr)) = if automated {
+                let tick = i as f32 * ticks_per_sample;
+                let g = eval_auto(&t.gain_auto, tick, t.gain);
+                let pan = eval_auto(&t.pan_auto, tick, t.pan);
+                let a = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+                (g, (a.cos(), a.sin()))
+            } else {
+                (t.gain, static_pan)
+            };
+            trk_l[i] = s * gain * pl;
+            trk_r[i] = s * gain * pr;
         }
 
         // Apply track FX insert chain
         apply_fx_chain(&mut trk_l, &mut trk_r, &t.fx, sr);
 
-        // Sum into master bus
         for i in 0..total_samples {
             master_l[i] += trk_l[i];
             master_r[i] += trk_r[i];
@@ -164,16 +239,32 @@ pub fn render(p: &Project) -> Stereo {
     // Apply master bus FX chain
     apply_fx_chain(&mut master_l, &mut master_r, &p.master_fx, sr);
 
+    if opts.metronome {
+        add_metronome(p, &mut master_l, &mut master_r, sr);
+    }
+
     // Soft limiter on master output
     for s in master_l.iter_mut().chain(master_r.iter_mut()) {
         *s = s.tanh();
     }
 
-    Stereo {
-        sample_rate: sr,
-        left: master_l,
-        right: master_r,
-    }
+    Stereo { sample_rate: sr, left: master_l, right: master_r }
+}
+
+/// Decode WAV bytes (8/16/24/32-bit int or 32-bit float) to mono f32 + sample rate.
+pub fn decode_wav(bytes: &[u8]) -> Result<(u32, Vec<f32>), String> {
+    let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
+    let spec = reader.spec();
+    let ch = spec.channels.max(1) as usize;
+    let raw: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(Result::ok).collect(),
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader.samples::<i32>().filter_map(Result::ok).map(|v| v as f32 / max).collect()
+        }
+    };
+    let mono = raw.chunks(ch).map(|f| f.iter().sum::<f32>() / ch as f32).collect();
+    Ok((spec.sample_rate, mono))
 }
 
 pub fn analyze(s: &Stereo) -> Analysis {
@@ -267,5 +358,40 @@ mod tests {
         let a = analyze(&s);
         assert!(a.peak > 0.02, "{a:?}");
         assert!(a.duration_sec > 2.0);
+    }
+
+    #[test]
+    fn solo_audio_clip_metronome_and_automation() {
+        let mut e = Engine::default();
+        let tone: Vec<f32> = (0..44100).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        let asset = e.import_audio("tone", 44100, &tone);
+        let a = e.apply(Command::AddTrack { name: "audio".into(), kind: TrackKind::Audio }).unwrap().track_id.unwrap();
+        e.apply(Command::AddClip { track: a, asset, start: 0, gain: None }).unwrap();
+        let i = e.apply(Command::AddTrack { name: "inst".into(), kind: TrackKind::Instrument { waveform: Waveform::Sine } }).unwrap().track_id.unwrap();
+        e.apply(Command::AddNote { track: i, start: 0, duration: 480, pitch: 60, velocity: 100, lyric: None }).unwrap();
+
+        let both = analyze(&render(&e.project)).rms;
+        // soloing the instrument must silence the audio clip (lower energy than both)
+        e.apply(Command::SetMix { track: i, gain: None, pan: None, mute: None, solo: Some(true) }).unwrap();
+        let solo = analyze(&render(&e.project)).rms;
+        assert!(solo < both, "solo={solo} both={both}");
+
+        // metronome adds energy
+        let plain = analyze(&render(&e.project)).rms;
+        let click = analyze(&render_with(&e.project, &RenderOptions { metronome: true })).rms;
+        assert!(click > plain);
+
+        // gain automation to zero silences the track
+        e.apply(Command::AddAutoPoint { track: i, param: kymion_core::AutoParam::Gain, tick: 0, value: 0.0 }).unwrap();
+        assert!(analyze(&render(&e.project)).peak < 1e-6);
+    }
+
+    #[test]
+    fn wav_roundtrip() {
+        let s = Stereo { sample_rate: 22050, left: vec![0.5; 100], right: vec![0.5; 100] };
+        let (sr, mono) = decode_wav(&to_wav_bytes(&s)).unwrap();
+        assert_eq!(sr, 22050);
+        assert_eq!(mono.len(), 100);
+        assert!((mono[0] - 0.5).abs() < 0.01);
     }
 }

@@ -1,6 +1,6 @@
 //! WASM bindings: the same Engine the CLI uses, driven from the browser GUI.
 
-use kymion_audio::{analyze, interleave, render, to_wav_bytes};
+use kymion_audio::{analyze, interleave, render, render_with, to_wav_bytes, RenderOptions};
 use kymion_core::{command_schema, midi::{export_midi, import_midi}, Engine, Project};
 use wasm_bindgen::prelude::*;
 
@@ -50,6 +50,28 @@ impl KymionEngine {
     }
     pub fn project_json(&self) -> String {
         self.inner.project.to_json()
+    }
+    /// Project JSON without embedded audio data (cheap for GUI refreshes).
+    pub fn project_json_light(&self) -> String {
+        self.inner.project.to_json_light()
+    }
+    /// Import mono f32 samples as an audio asset; returns the asset id.
+    pub fn import_audio(&mut self, name: &str, sample_rate: u32, samples: &[f32]) -> u32 {
+        self.inner.import_audio(name, sample_rate, samples)
+    }
+    /// Peak envelope (max |sample| per bucket) of an asset for waveform drawing.
+    pub fn asset_peaks(&self, asset: u32, buckets: u32) -> Vec<f32> {
+        let Some(a) = self.inner.project.assets.iter().find(|a| a.id == asset) else { return vec![] };
+        let data = a.samples();
+        let n = buckets.max(1) as usize;
+        let step = (data.len() / n).max(1);
+        (0..n)
+            .map(|i| data[(i * step).min(data.len())..((i + 1) * step).min(data.len())].iter().fold(0f32, |m, v| m.max(v.abs())))
+            .collect()
+    }
+    /// Render with a metronome click (interleaved stereo f32).
+    pub fn render_opts(&self, metronome: bool) -> Vec<f32> {
+        interleave(&render_with(&self.inner.project, &RenderOptions { metronome }))
     }
     pub fn sample_rate(&self) -> u32 {
         self.inner.project.sample_rate

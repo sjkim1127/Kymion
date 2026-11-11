@@ -11,20 +11,47 @@
 <header>
   <img src="logo.svg" alt="Kymion" class="logo">
   <h1>KYMION</h1>
-  <div class="spacer"></div>
-  <button id="play">▶ Play</button>
-  <button id="stop">■ Stop</button>
-  <button id="undo">↶</button>
-  <button id="redo">↷</button>
+  <div class="divider"></div>
+  <div class="grp transport">
+    <button id="stop" title="Stop / return to start (Enter)">■</button>
+    <button id="play" title="Play / pause (Space)">▶</button>
+    <button id="loop" title="Loop region (L)">⟲ Loop</button>
+    <button id="metro" title="Metronome (M)">♪ Click</button>
+  </div>
+  <div id="pos" title="bar : beat : tick  |  seconds">001:1:000</div>
   <label>BPM <input id="tempo" type="number" min="20" max="400" value="120"></label>
+  <label>Sig <input id="ts-num" type="number" min="1" max="32" value="4" style="width:38px"> /
+    <select id="ts-den"><option>2</option><option selected>4</option><option>8</option><option>16</option></select></label>
+  <label>Snap <select id="snap">
+    <option value="480">1/4</option><option value="240" selected>1/8</option>
+    <option value="120">1/16</option><option value="60">1/32</option><option value="1">Off</option></select></label>
+  <div class="divider"></div>
+  <div class="grp">
+    <button id="view-arrange" title="Arrangement view (Tab)">Arrange</button>
+    <button id="view-roll" title="Piano roll (Tab)">Piano Roll</button>
+  </div>
+  <div class="grp">
+    <button id="tool-draw" title="Draw tool (D)">✎ Draw</button>
+    <button id="tool-select" title="Select tool (V)">⬚ Select</button>
+  </div>
+  <div class="grp">
+    <button id="zoom-out" title="Zoom out (Ctrl+wheel)">−</button>
+    <button id="zoom-in" title="Zoom in">+</button>
+  </div>
+  <div class="spacer"></div>
+  <button id="undo" title="Undo (Ctrl+Z)">↶</button>
+  <button id="redo" title="Redo (Ctrl+Shift+Z)">↷</button>
+  <button id="quantize" title="Quantize selected track to snap grid">Quantize</button>
   <div class="divider"></div>
   <button id="import-midi">Import MIDI</button>
   <button id="export-midi">Export MIDI</button>
+  <button id="import-audio">Import Audio</button>
   <button id="wav">Export WAV</button>
-  <button id="save">Save JSON</button>
-  <button id="load">Load JSON</button>
+  <button id="save">Save</button>
+  <button id="load">Load</button>
   <input id="file" type="file" accept=".json" hidden>
   <input id="midi-file" type="file" accept=".mid,.midi" hidden>
+  <input id="audio-file" type="file" accept="audio/*,.wav,.mp3,.ogg,.flac" hidden>
 </header>
 <main>
   <aside>
@@ -33,6 +60,15 @@
     <div class="btn-row">
       <button id="add-inst">+ Instrument</button>
       <button id="add-vocal">+ Vocal</button>
+      <button id="add-audio">+ Audio</button>
+    </div>
+
+    <h2>Automation (selected track)</h2>
+    <div class="row"><select id="auto-param"><option value="gain">Gain</option><option value="pan">Pan</option></select>
+      <input id="auto-val" type="range" min="0" max="2" step="0.05" value="1"><span id="auto-val-txt" style="width:30px">1.00</span></div>
+    <div class="btn-row">
+      <button id="auto-add">+ Point @ playhead</button>
+      <button id="auto-clear">Clear</button>
     </div>
 
     <h2>Track FX Chain</h2>

@@ -3,8 +3,8 @@
 //! Project files are plain JSON, edits are JSON commands (see `kymion schema`).
 
 use clap::{Parser, Subcommand};
-use kymion_audio::{analyze, render, to_wav_bytes};
-use kymion_core::{command_schema, midi::{export_midi, import_midi}, Command, Engine, Project};
+use kymion_audio::{analyze, decode_wav, render_with, to_wav_bytes, RenderOptions};
+use kymion_core::{command_schema, midi::{export_midi, import_midi}, Command, Engine, Project, TrackKind};
 use serde_json::{json, Value};
 use std::io::Read;
 use std::path::PathBuf;
@@ -53,10 +53,24 @@ enum Cmd {
         path: PathBuf,
         #[arg(short, long)]
         out: PathBuf,
+        /// Mix in a metronome click.
+        #[arg(long)]
+        metronome: bool,
     },
     /// Render and report peak/RMS/clipping/duration (verify without listening).
     Analyze {
         path: PathBuf,
+    },
+    /// Import a WAV file as an audio asset and place it as a clip.
+    ImportAudio {
+        project: PathBuf,
+        wav: PathBuf,
+        /// Existing audio track id (a new audio track is created if omitted).
+        #[arg(long)]
+        track: Option<u32>,
+        /// Clip start position in ticks.
+        #[arg(long, default_value_t = 0)]
+        start: u32,
     },
     /// Import a Standard MIDI File (.mid) into a Kymion project.
     ImportMidi {
@@ -99,7 +113,9 @@ fn run(cli: Cli) -> Result<Value, String> {
                         "kind": t.kind,
                         "notes": t.notes.len(),
                         "fx": t.fx.len(),
-                        "mute": t.mute
+                        "clips": t.clips.len(),
+                        "mute": t.mute,
+                        "solo": t.solo
                     })
                 })
                 .collect();
@@ -107,6 +123,9 @@ fn run(cli: Cli) -> Result<Value, String> {
                 "ok": true,
                 "name": p.name,
                 "tempo": p.tempo,
+                "time_signature": [p.time_sig_num, p.time_sig_den],
+                "loop": p.loop_region,
+                "assets": p.assets.iter().map(|a| json!({"id": a.id, "name": a.name, "duration_sec": a.duration_secs()})).collect::<Vec<_>>(),
                 "length_ticks": p.length_ticks(),
                 "length_sec": p.ticks_to_secs(p.length_ticks()),
                 "tracks": tracks,
@@ -149,12 +168,33 @@ fn run(cli: Cli) -> Result<Value, String> {
             Ok(json!({"ok": true, "applied": outcomes.len(), "outcomes": outcomes, "dry_run": dry_run}))
         }
         Cmd::Schema => serde_json::from_str(&command_schema()).map_err(|e| e.to_string()),
-        Cmd::Render { path, out } => {
-            let s = render(&load(&path)?);
+        Cmd::Render { path, out, metronome } => {
+            let s = render_with(&load(&path)?, &RenderOptions { metronome });
             std::fs::write(&out, to_wav_bytes(&s)).map_err(|e| e.to_string())?;
             Ok(json!({"ok": true, "out": out, "analysis": analyze(&s)}))
         }
-        Cmd::Analyze { path } => Ok(json!({"ok": true, "analysis": analyze(&render(&load(&path)?))})),
+        Cmd::Analyze { path } => Ok(json!({"ok": true, "analysis": analyze(&render_with(&load(&path)?, &RenderOptions::default()))})),
+        Cmd::ImportAudio { project, wav, track, start } => {
+            let bytes = std::fs::read(&wav).map_err(|e| format!("{}: {e}", wav.display()))?;
+            let (sr, samples) = decode_wav(&bytes)?;
+            let name = wav.file_stem().and_then(|s| s.to_str()).unwrap_or("audio").to_string();
+            let mut e = Engine::new(load(&project)?);
+            let asset = e.import_audio(&name, sr, &samples);
+            let track_id = match track {
+                Some(t) => t,
+                None => e
+                    .apply(Command::AddTrack { name: name.clone(), kind: TrackKind::Audio })
+                    .map_err(|er| er.to_string())?
+                    .track_id
+                    .unwrap(),
+            };
+            let o = e
+                .apply(Command::AddClip { track: track_id, asset, start, gain: None })
+                .map_err(|er| er.to_string())?;
+            std::fs::write(&project, e.project.to_json()).map_err(|e| e.to_string())?;
+            Ok(json!({"ok": true, "asset_id": asset, "track_id": track_id, "clip_id": o.clip_id,
+                      "duration_sec": samples.len() as f32 / sr as f32, "sample_rate": sr}))
+        }
         Cmd::ImportMidi { midi_path, out } => {
             let bytes = std::fs::read(&midi_path).map_err(|e| format!("{}: {e}", midi_path.display()))?;
             let project = import_midi(&bytes).map_err(|e| e.to_string())?;

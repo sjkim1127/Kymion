@@ -19,6 +19,7 @@ body {
   overflow: hidden;
 }
 header {
+  flex-wrap: wrap;
   display: flex;
   gap: 8px;
   align-items: center;
@@ -97,6 +98,7 @@ canvas { width: 100%; height: 100%; display: block; }
   margin-bottom: 4px;
 }
 .fx-header {
+  flex-wrap: wrap;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -143,3 +145,19 @@ pre {
   border-radius: 4px;
   border: 1px solid var(--line);
 }
+
+.grp { display: flex; gap: 0; }
+.grp button { border-radius: 0; margin-left: -1px; }
+.grp button:first-child { border-radius: 4px 0 0 4px; margin-left: 0; }
+.grp button:last-child { border-radius: 0 4px 4px 0; }
+#pos { font: 600 12px ui-monospace, monospace; color: #7fe3a0; background: #0a0a0d; border: 1px solid var(--line); border-radius: 4px; padding: 4px 8px; min-width: 120px; text-align: center; }
+label { color: #aaa; font-size: 11px; display: flex; align-items: center; gap: 4px; }
+select { background: #202026; color: var(--fg); border: 1px solid #383842; border-radius: 4px; padding: 3px; font-size: 11px; }
+.empty { color: #666; font-size: 11px; padding: 4px 0; }
+.ms { padding: 1px 5px; font-size: 10px; min-width: 20px; }
+.ms.on-mute { background: #6b2b2b; border-color: #c55; }
+.ms.on-solo { background: #6b5d1f; border-color: #d4af37; }
+.trk { flex-wrap: wrap; }
+.trk input[type=range] { width: 100%; }
+.tname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 130px; }
+button.active { background: #3a3a22; border-color: var(--gold); color: #fff; }

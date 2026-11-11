@@ -34,6 +34,18 @@ pub fn import_midi(bytes: &[u8]) -> Result<Project> {
         }
     }
 
+    for track in &smf.tracks {
+        for event in track {
+            if let TrackEventKind::Meta(MetaMessage::TimeSignature(n, d_pow, _, _)) = event.kind {
+                let den = 1u8 << d_pow.min(4);
+                if n > 0 && n <= 32 {
+                    project.time_sig_num = n;
+                    project.time_sig_den = den;
+                }
+            }
+        }
+    }
+
     let mut track_id = 1u32;
 
     for (t_idx, smf_track) in smf.tracks.iter().enumerate() {
@@ -147,17 +159,9 @@ pub fn import_midi(bytes: &[u8]) -> Result<Project> {
             TrackKind::Instrument { waveform: Waveform::Pluck }
         };
 
-        project.tracks.push(Track {
-            id: track_id,
-            name: track_name,
-            kind,
-            gain: 0.8,
-            pan: 0.0,
-            mute: false,
-            expression: Default::default(),
-            fx: Vec::new(),
-            notes,
-        });
+        let mut trk = Track::new(track_id, track_name, kind);
+        trk.notes = notes;
+        project.tracks.push(trk);
 
         track_id += 1;
     }
@@ -182,7 +186,7 @@ pub fn export_midi(project: &Project) -> Result<Vec<u8>> {
     };
     let time_sig_event = TrackEvent {
         delta: u28::from(0u32),
-        kind: TrackEventKind::Meta(MetaMessage::TimeSignature(4, 2, 24, 8)),
+        kind: TrackEventKind::Meta(MetaMessage::TimeSignature(project.time_sig_num, project.time_sig_den.max(1).trailing_zeros() as u8, 24, 8)),
     };
     let end_event = TrackEvent {
         delta: u28::from(0u32),
@@ -265,20 +269,11 @@ mod tests {
     fn midi_roundtrip() {
         let mut p = Project::new("MIDI Test");
         p.tempo = 140.0;
-        let t = Track {
-            id: 1,
-            name: "Lead".into(),
-            kind: TrackKind::Vocal { voice: "default".into() },
-            gain: 1.0,
-            pan: 0.0,
-            mute: false,
-            expression: Default::default(),
-            fx: Vec::new(),
-            notes: vec![
-                Note { id: 1, start: 0, duration: 480, pitch: 60, velocity: 100, lyric: Some("Do".into()), expression: None },
-                Note { id: 2, start: 480, duration: 480, pitch: 62, velocity: 110, lyric: Some("Re".into()), expression: None },
-            ],
-        };
+        let mut t = Track::new(1, "Lead", TrackKind::Vocal { voice: "default".into() });
+        t.notes = vec![
+            Note { id: 1, start: 0, duration: 480, pitch: 60, velocity: 100, lyric: Some("Do".into()), expression: None },
+            Note { id: 2, start: 480, duration: 480, pitch: 62, velocity: 110, lyric: Some("Re".into()), expression: None },
+        ];
         p.tracks.push(t);
 
         let midi_bytes = export_midi(&p).expect("export should succeed");
