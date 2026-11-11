@@ -189,7 +189,14 @@ fn run(cli: Cli) -> Result<Value, String> {
                     .unwrap(),
             };
             let o = e
-                .apply(Command::AddClip { track: track_id, asset, start, gain: None })
+                .apply(Command::AddClip {
+                    track: track_id,
+                    asset,
+                    start,
+                    gain: None,
+                    offset_ticks: None,
+                    duration_ticks: None,
+                })
                 .map_err(|er| er.to_string())?;
             std::fs::write(&project, e.project.to_json()).map_err(|e| e.to_string())?;
             Ok(json!({"ok": true, "asset_id": asset, "track_id": track_id, "clip_id": o.clip_id,

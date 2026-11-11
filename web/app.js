@@ -13,7 +13,8 @@ let snap = 240;
 let sel = null;                   // selected track id
 let selNotes = new Set(), selClip = null;
 let playhead = 0, playing = false, metro = false;
-let ctx = null, srcNode = null, t0 = 0, startTick = 0, cache = null, dirty = true, restartTimer = null;
+let ctx = null, srcNode = null, t0 = 0, startTick = 0, cache = null, dirty = true;
+let workletNode = null, streamPos = 0, workletBuffered = 0, lastMeterUpdate = 0;
 let drag = null, clipboard = [];
 const peaksCache = new Map();
 
@@ -27,8 +28,9 @@ const snapDelta = (d) => (snap <= 1 ? Math.round(d) : Math.round(d / snap) * sna
 const snapFloor = (t) => Math.max(0, snap <= 1 ? Math.round(t) : Math.floor(t / snap) * snap);
 const snapRound = (t) => Math.max(0, snap <= 1 ? Math.round(t) : Math.round(t / snap) * snap);
 const clipLen = (c) => {
-  const a = P.assets.find((x) => x.id === c.asset);
-  return a ? Math.round(a.duration_sec * P.tempo * PPQ / 60) : 0;
+  if (c.duration_ticks) return c.duration_ticks;
+  const a = P?.assets?.find((x) => x.id === c.asset);
+  return a ? Math.max(0, Math.round(a.duration_sec * P.tempo * PPQ / 60) - (c.offset_ticks || 0)) : 0;
 };
 
 // ───────────────────────── command entry point ─────────────────────────
@@ -53,6 +55,7 @@ window.kymion = {
   importMidi: (bytes) => { eng = KymionEngine.import_midi(bytes); refresh(); },
   exportMidi: () => eng.export_midi(),
   play: () => play(), stop: () => stopAll(), get playhead() { return curTick(); },
+  meters: () => JSON.parse(eng.meter_levels(streamPos, 2048)),
 };
 
 // ───────────────────────── refresh / side panels ─────────────────────────
@@ -76,9 +79,18 @@ function refresh() {
   renderFxRacks();
   renderExpr();
   dirty = true;
-  if (playing) { clearTimeout(restartTimer); restartTimer = setTimeout(() => play(curTick()), 250); }
+  if (playing && workletNode) {
+    // Prime new audio forward from current playhead so edits are heard seamlessly
+    const sr = eng.sample_rate();
+    streamPos = Math.round(playhead * spt() * sr);
+    workletNode.port.postMessage({ type: "clear" });
+    workletBuffered = 0;
+    feedWorklet();
+  }
   draw();
 }
+
+const panText = (p) => (p === 0 ? "C" : p < 0 ? `L${Math.round(-p * 100)}` : `R${Math.round(p * 100)}`);
 
 function renderTracks() {
   const box = $("tracks");
@@ -87,12 +99,27 @@ function renderTracks() {
     const icon = t.kind.type === "vocal" ? "🎤" : t.kind.type === "audio" ? "🔊" : "🎹";
     const d = document.createElement("div");
     d.className = "trk" + (t.id === sel ? " sel" : "");
-    d.innerHTML = `<span class="tname" title="Double-click to rename">${icon} ${t.name}${t.fx.length ? ` [${t.fx.length} FX]` : ""}</span>
-      <span class="spacer" style="flex:1"></span>
-      <button class="ms ${t.mute ? "on-mute" : ""}" data-a="mute" title="Mute">M</button>
-      <button class="ms ${t.solo ? "on-solo" : ""}" data-a="solo" title="Solo">S</button>
-      <button class="ms" data-a="del" title="Delete track">×</button>
-      <input type="range" min="0" max="1.5" step="0.05" value="${t.gain}" title="Volume">`;
+    d.dataset.tid = t.id;
+    d.innerHTML = `
+      <div style="display:flex;align-items:center;width:100%;gap:4px">
+        <span class="tname" title="Double-click to rename">${icon} ${t.name}${t.fx.length ? ` [${t.fx.length} FX]` : ""}</span>
+        <span class="spacer" style="flex:1"></span>
+        <button class="ms ${t.mute ? "on-mute" : ""}" data-a="mute" title="Mute">M</button>
+        <button class="ms ${t.solo ? "on-solo" : ""}" data-a="solo" title="Solo">S</button>
+        <button class="ms" data-a="del" title="Delete track">×</button>
+      </div>
+      <div class="trk-controls">
+        <div class="trk-row">
+          <span class="lbl">Vol</span>
+          <input type="range" class="vol-slider" min="0" max="1.5" step="0.05" value="${t.gain}" title="Volume (${Math.round(t.gain * 100)}%)">
+          <div class="trk-meter-wrap"><div class="trk-meter-fill" data-meter-tid="${t.id}"></div></div>
+        </div>
+        <div class="trk-row">
+          <span class="lbl">Pan</span>
+          <input type="range" class="pan-slider" min="-1" max="1" step="0.05" value="${t.pan}" title="Pan">
+          <span class="pan-lbl">${panText(t.pan)}</span>
+        </div>
+      </div>`;
     d.onclick = () => { sel = t.id; selNotes.clear(); selClip = null; refresh(); };
     d.querySelector(".tname").ondblclick = (e) => {
       e.stopPropagation();
@@ -106,9 +133,20 @@ function renderTracks() {
       else if (a === "solo") apply({ cmd: "set_mix", track: t.id, solo: !t.solo });
       else if (confirm(`Delete track "${t.name}"?`)) apply({ cmd: "remove_track", track: t.id });
     }));
-    const g = d.querySelector("input");
-    g.onclick = (e) => e.stopPropagation();
-    g.onchange = () => apply({ cmd: "set_mix", track: t.id, gain: +g.value });
+    const vol = d.querySelector(".vol-slider");
+    vol.onclick = (e) => e.stopPropagation();
+    vol.oninput = (e) => {
+      e.stopPropagation();
+      apply({ cmd: "set_mix", track: t.id, gain: +vol.value });
+    };
+    const pan = d.querySelector(".pan-slider");
+    const panLbl = d.querySelector(".pan-lbl");
+    pan.onclick = (e) => e.stopPropagation();
+    pan.oninput = (e) => {
+      e.stopPropagation();
+      panLbl.textContent = panText(+pan.value);
+      apply({ cmd: "set_mix", track: t.id, pan: +pan.value });
+    };
     box.append(d);
   }
 }
@@ -305,20 +343,108 @@ function drawArrange() {
     if (t.id === sel) { g.strokeStyle = "#d4af37"; g.strokeRect(0.5, y + 0.5, W - 1, LANE_H - 1); }
     // content
     if (t.kind.type === "audio") {
+      const aTotal = (asset) => {
+        const item = P.assets.find((x) => x.id === asset);
+        return item ? item.duration_sec * P.tempo * PPQ / 60 : 1;
+      };
+
       for (const c of t.clips) {
-        const x = tickToX(c.start), w = clipLen(c) * ppt;
-        if (x + w < gutter() || x > W) continue;
-        g.fillStyle = c.id === selClip ? "rgba(111,207,151,0.45)" : "rgba(111,207,151,0.25)";
-        g.fillRect(x, y + 4, w, LANE_H - 8);
-        g.strokeStyle = c.id === selClip ? "#fff" : col; g.strokeRect(x + 0.5, y + 4.5, w, LANE_H - 9);
-        const pk = getPeaks(c.asset);
-        g.fillStyle = col;
-        const mid = y + LANE_H / 2, amp = (LANE_H - 14) / 2;
-        const dx = drag?.type === "clip" && drag.clip === c.id ? drag.dTick * ppt : 0;
-        for (let px = 0; px < w; px += 1) {
-          const v = pk[Math.min(pk.length - 1, Math.floor((px / w) * pk.length))] ?? 0;
-          g.fillRect(x + dx + px, mid - v * amp, 1, Math.max(1, v * amp * 2));
+        let cStart = c.start;
+        let cLen = clipLen(c);
+        let cOff = c.offset_ticks || 0;
+        let cFi = c.fade_in_ticks || 0;
+        let cFo = c.fade_out_ticks || 0;
+
+        if (drag?.clip === c.id) {
+          if (drag.type === "clip") cStart = Math.max(0, c.start + drag.dTick);
+          else if (drag.type === "trim_start") {
+            const shift = Math.max(-c.start, Math.min(cLen - (snap <= 1 ? 30 : snap), drag.dTick));
+            cStart += shift;
+            cOff = Math.max(0, cOff + shift);
+            cLen = Math.max(30, cLen - shift);
+          } else if (drag.type === "trim_end") {
+            cLen = Math.max(30, cLen + drag.dTick);
+          } else if (drag.type === "fade_in") {
+            cFi = Math.max(0, Math.min(cLen, (drag.orig || 0) + drag.dTick));
+          } else if (drag.type === "fade_out") {
+            cFo = Math.max(0, Math.min(cLen, (drag.orig || 0) + drag.dTick));
+          }
         }
+
+        const x = tickToX(cStart), w = cLen * ppt;
+        if (x + w < gutter() || x > W) continue;
+
+        // Clip container background
+        g.fillStyle = c.id === selClip ? "rgba(111,207,151,0.40)" : "rgba(111,207,151,0.20)";
+        g.fillRect(x, y + 4, w, LANE_H - 8);
+
+        // Clip border
+        g.strokeStyle = c.id === selClip ? "#fff" : col;
+        g.strokeRect(x + 0.5, y + 4.5, w, LANE_H - 9);
+
+        // Waveform
+        const pk = getPeaks(c.asset);
+        const totalAssetTicks = aTotal(c.asset);
+        const startFrac = Math.max(0, cOff / totalAssetTicks);
+        const durFrac = Math.max(0, cLen / totalAssetTicks);
+
+        g.fillStyle = col;
+        const mid = y + LANE_H / 2, amp = (LANE_H - 18) / 2;
+        for (let px = 0; px < w; px += 1) {
+          const frac = startFrac + (px / Math.max(1, w)) * durFrac;
+          const idx = Math.min(pk.length - 1, Math.max(0, Math.floor(frac * pk.length)));
+          const v = pk[idx] ?? 0;
+          g.fillRect(x + px, mid - v * amp, 1, Math.max(1, v * amp * 2));
+        }
+
+        // Fade in slope
+        if (cFi > 0) {
+          const fiW = Math.min(w, cFi * ppt);
+          g.fillStyle = "rgba(0,0,0,0.45)";
+          g.beginPath();
+          g.moveTo(x, y + 4);
+          g.lineTo(x + fiW, y + 4);
+          g.lineTo(x, y + LANE_H - 4);
+          g.closePath();
+          g.fill();
+          g.strokeStyle = "#fff";
+          g.lineWidth = 1.5;
+          g.beginPath();
+          g.moveTo(x, y + LANE_H - 4);
+          g.lineTo(x + fiW, y + 4);
+          g.stroke();
+          g.lineWidth = 1;
+        }
+
+        // Fade out slope
+        if (cFo > 0) {
+          const foW = Math.min(w, cFo * ppt);
+          g.fillStyle = "rgba(0,0,0,0.45)";
+          g.beginPath();
+          g.moveTo(x + w, y + 4);
+          g.lineTo(x + w - foW, y + 4);
+          g.lineTo(x + w, y + LANE_H - 4);
+          g.closePath();
+          g.fill();
+          g.strokeStyle = "#fff";
+          g.lineWidth = 1.5;
+          g.beginPath();
+          g.moveTo(x + w - foW, y + 4);
+          g.lineTo(x + w, y + LANE_H - 4);
+          g.stroke();
+          g.lineWidth = 1;
+        }
+
+        // Trim handles visual indicator
+        g.fillStyle = "rgba(255,255,255,0.3)";
+        g.fillRect(x, y + 4, 3, LANE_H - 8);
+        g.fillRect(x + w - 3, y + 4, 3, LANE_H - 8);
+
+        // Clip label
+        const assetObj = P.assets.find((a) => a.id === c.asset);
+        g.fillStyle = "#fff";
+        g.font = "9px sans-serif";
+        g.fillText(`${assetObj?.name || "Audio"}${c.gain !== 1 ? ` (${(c.gain || 1).toFixed(1)}x)` : ""}`, x + 5, y + 14);
       }
     } else if (t.notes.length) {
       const lo = Math.min(...t.notes.map((n) => n.pitch)), hi = Math.max(...t.notes.map((n) => n.pitch), lo + 11);
@@ -341,51 +467,140 @@ function drawArrange() {
   g.restore();
 }
 
-// ───────────────────────── transport ─────────────────────────
+// ───────────────────────── transport & real-time AudioWorklet ─────────────────────────
+async function initWorklet() {
+  ctx ??= new AudioContext({ sampleRate: eng.sample_rate() });
+  if (ctx.state === "suspended") await ctx.resume();
+  if (!workletNode) {
+    try {
+      await ctx.audioWorklet.addModule("worklet.js");
+      workletNode = new AudioWorkletNode(ctx, "kymion-worklet-processor");
+      workletNode.connect(ctx.destination);
+      workletNode.port.onmessage = (e) => onWorkletMessage(e.data);
+    } catch (err) {
+      console.warn("AudioWorklet unavailable, using fallback player:", err);
+    }
+  }
+}
+
+function onWorkletMessage(msg) {
+  if (msg.type === "status") {
+    workletBuffered = msg.buffered;
+    if (msg.playing) {
+      const sr = eng.sample_rate();
+      playhead = (msg.totalSamples / sr) / spt();
+      updatePos();
+
+      // Master meter display
+      const pL = Math.min(100, Math.round(Math.pow(msg.peakL, 0.6) * 100));
+      const pR = Math.min(100, Math.round(Math.pow(msg.peakR, 0.6) * 100));
+      const ml = $("meter-l"), mr = $("meter-r");
+      if (ml) ml.style.width = pL + "%";
+      if (mr) mr.style.width = pR + "%";
+
+      // Track meters update
+      const now = performance.now();
+      if (now - lastMeterUpdate > 45) {
+        lastMeterUpdate = now;
+        try {
+          const metersJson = eng.meter_levels(msg.totalSamples, 2048);
+          const m = JSON.parse(metersJson);
+          if (m.tracks) {
+            for (const [tid, tMeter] of Object.entries(m.tracks)) {
+              const el = document.querySelector(`.trk-meter-fill[data-meter-tid="${tid}"]`);
+              if (el) {
+                const val = Math.min(100, Math.round(Math.pow(tMeter.peak, 0.6) * 100));
+                el.style.height = val + "%";
+              }
+            }
+          }
+        } catch {}
+      }
+    }
+  }
+}
+
+function feedWorklet() {
+  if (!playing || !workletNode) return;
+  const CHUNK = 8192;
+  while (workletBuffered < 16384) {
+    const slice = eng.render_slice(streamPos, CHUNK, metro);
+    workletNode.port.postMessage({ type: "push", data: slice }, [slice.buffer]);
+    streamPos += CHUNK;
+    workletBuffered += CHUNK;
+  }
+}
+
 function curTick() {
   if (!playing) return playhead;
+  if (workletNode) return playhead;
   let t = startTick + (ctx.currentTime - t0) / spt();
   const lr = P.loop_region;
   if (lr && t >= lr.end) t = lr.start + ((t - lr.start) % (lr.end - lr.start));
   return t;
 }
+
 function updatePos() {
   if (!P) return;
-  const t = Math.max(0, playing ? curTick() : playhead);
+  const t = Math.max(0, curTick());
   const beat = PPQ * 4 / P.time_sig_den, bar = beat * P.time_sig_num;
   const b = Math.floor(t / bar) + 1, bt = Math.floor((t % bar) / beat) + 1, tk = Math.floor(t % beat);
   $("pos").textContent = `${String(b).padStart(3, "0")}:${bt}:${String(tk).padStart(3, "0")}  ${(t * spt()).toFixed(2)}s`;
 }
-async function ensureBuffer() {
-  ctx ??= new AudioContext({ sampleRate: eng.sample_rate() });
-  await ctx.resume();
-  if (cache && !dirty && cache.metro === metro) return cache.buf;
-  const data = eng.render_opts(metro), n = data.length / 2, sr = eng.sample_rate();
-  const buf = ctx.createBuffer(2, Math.max(n, 1), sr);
-  const L = buf.getChannelData(0), R = buf.getChannelData(1);
-  for (let i = 0; i < n; i++) { L[i] = data[2 * i]; R[i] = data[2 * i + 1]; }
-  cache = { buf, metro }; dirty = false;
-  return buf;
+
+function clearMeters() {
+  const ml = $("meter-l"), mr = $("meter-r");
+  if (ml) ml.style.width = "0%";
+  if (mr) mr.style.width = "0%";
+  document.querySelectorAll(".trk-meter-fill").forEach((el) => (el.style.height = "0%"));
 }
+
 function stopSrc() {
   if (srcNode) { srcNode.onended = null; try { srcNode.stop(); } catch {} srcNode = null; }
 }
+
 async function play(from = playhead) {
   stopSrc();
-  const buf = await ensureBuffer();
+  await initWorklet();
   const lr = P.loop_region;
   if (lr && from >= lr.end) from = lr.start;
-  const s = ctx.createBufferSource();
-  s.buffer = buf; s.connect(ctx.destination);
-  if (lr) { s.loop = true; s.loopStart = lr.start * spt(); s.loopEnd = lr.end * spt(); }
-  s.start(0, Math.max(0, from * spt()));
-  s.onended = () => { if (srcNode === s) { srcNode = null; playing = false; playhead = Math.min(playhead, from); $("play").textContent = "▶"; draw(); } };
-  srcNode = s; t0 = ctx.currentTime; startTick = from; playing = true;
-  $("play").textContent = "⏸";
-  requestAnimationFrame(frame);
+  playhead = from;
+
+  if (workletNode) {
+    const sr = eng.sample_rate();
+    streamPos = Math.round(from * spt() * sr);
+    workletNode.port.postMessage({ type: "clear" });
+    workletBuffered = 0;
+    workletNode.port.postMessage({
+      type: "set_playing",
+      playing: true,
+      totalSamples: streamPos,
+    });
+    feedWorklet();
+    playing = true;
+    $("play").textContent = "⏸";
+    requestAnimationFrame(frame);
+  } else {
+    ctx ??= new AudioContext({ sampleRate: eng.sample_rate() });
+    await ctx.resume();
+    const data = eng.render_opts(metro), n = data.length / 2, sr = eng.sample_rate();
+    const buf = ctx.createBuffer(2, Math.max(n, 1), sr);
+    const L = buf.getChannelData(0), R = buf.getChannelData(1);
+    for (let i = 0; i < n; i++) { L[i] = data[2 * i]; R[i] = data[2 * i + 1]; }
+    const s = ctx.createBufferSource();
+    s.buffer = buf; s.connect(ctx.destination);
+    if (lr) { s.loop = true; s.loopStart = lr.start * spt(); s.loopEnd = lr.end * spt(); }
+    s.start(0, Math.max(0, from * spt()));
+    s.onended = () => { if (srcNode === s) { srcNode = null; playing = false; playhead = Math.min(playhead, from); $("play").textContent = "▶"; clearMeters(); draw(); } };
+    srcNode = s; t0 = ctx.currentTime; startTick = from; playing = true;
+    $("play").textContent = "⏸";
+    requestAnimationFrame(frame);
+  }
 }
+
 function frame() {
   if (!playing) return;
+  feedWorklet();
   const t = curTick();
   const x = tickToX(t);
   if (x > W - 40) scrollX = t - 40 / ppt;
@@ -393,15 +608,33 @@ function frame() {
   draw();
   requestAnimationFrame(frame);
 }
+
 function pause() {
-  playhead = curTick(); stopSrc(); playing = false; $("play").textContent = "▶"; draw();
-}
-function stopAll() {
-  stopSrc(); playing = false; $("play").textContent = "▶";
-  playhead = P.loop_region ? P.loop_region.start : 0;
-  scrollX = Math.max(0, Math.min(scrollX, playhead));
+  if (workletNode) {
+    workletNode.port.postMessage({ type: "set_playing", playing: false });
+    workletNode.port.postMessage({ type: "clear" });
+  }
+  stopSrc();
+  playing = false;
+  $("play").textContent = "▶";
+  clearMeters();
   draw();
 }
+
+function stopAll() {
+  if (workletNode) {
+    workletNode.port.postMessage({ type: "set_playing", playing: false });
+    workletNode.port.postMessage({ type: "clear" });
+  }
+  stopSrc();
+  playing = false;
+  $("play").textContent = "▶";
+  playhead = P.loop_region ? P.loop_region.start : 0;
+  scrollX = Math.max(0, Math.min(scrollX, playhead));
+  clearMeters();
+  draw();
+}
+
 function seek(t) {
   playhead = Math.max(0, t);
   if (playing) play(playhead); else draw();
@@ -474,18 +707,68 @@ function arrangeDown(x, y, e) {
   if (y < RULER_H) return;
   const idx = Math.floor((y - RULER_H + scrollY) / LANE_H), t = P.tracks[idx];
   if (!t) return;
-  sel = t.id; selNotes.clear(); selClip = null;
+  sel = t.id; selNotes.clear();
   if (x >= gutter() && t.kind.type === "audio") {
     const tick = xToTick(x);
     const c = t.clips.find((c) => tick >= c.start && tick <= c.start + clipLen(c));
-    if (c) { selClip = c.id; drag = { type: "clip", clip: c.id, track: t.id, x0: x, dTick: 0, start: c.start }; }
+    if (c) {
+      selClip = c.id;
+      const cX = tickToX(c.start);
+      const cW = clipLen(c) * ppt;
+      const cY = RULER_H + idx * LANE_H - scrollY;
+      const fiW = (c.fade_in_ticks || 0) * ppt;
+      const foW = (c.fade_out_ticks || 0) * ppt;
+
+      if (y <= cY + 18 && Math.abs(x - (cX + fiW)) <= 10) {
+        drag = { type: "fade_in", clip: c.id, track: t.id, x0: x, orig: c.fade_in_ticks || 0, dTick: 0 };
+      } else if (y <= cY + 18 && Math.abs(x - (cX + cW - foW)) <= 10) {
+        drag = { type: "fade_out", clip: c.id, track: t.id, x0: x, orig: c.fade_out_ticks || 0, dTick: 0 };
+      } else if (x <= cX + 8) {
+        drag = { type: "trim_start", clip: c.id, track: t.id, x0: x, start0: c.start, off0: c.offset_ticks || 0, dur0: clipLen(c), dTick: 0 };
+      } else if (x >= cX + cW - 8) {
+        drag = { type: "trim_end", clip: c.id, track: t.id, x0: x, dur0: clipLen(c), dTick: 0 };
+      } else {
+        drag = { type: "clip", clip: c.id, track: t.id, x0: x, dTick: 0, start: c.start };
+      }
+    } else {
+      selClip = null;
+    }
+  } else {
+    selClip = null;
   }
   refresh();
 }
 
 cv.addEventListener("pointermove", (e) => {
-  if (!drag) return;
   const [x, y] = local(e);
+  if (!drag) {
+    if (view === "arrange") {
+      const idx = Math.floor((y - RULER_H + scrollY) / LANE_H);
+      const t = P?.tracks?.[idx];
+      if (t && t.kind.type === "audio" && x >= gutter() && y >= RULER_H) {
+        const tick = xToTick(x);
+        const c = t.clips.find((c) => tick >= c.start && tick <= c.start + clipLen(c));
+        if (c) {
+          const cX = tickToX(c.start);
+          const cW = clipLen(c) * ppt;
+          const cY = RULER_H + idx * LANE_H - scrollY;
+          const fiW = (c.fade_in_ticks || 0) * ppt;
+          const foW = (c.fade_out_ticks || 0) * ppt;
+          if (y <= cY + 18 && (Math.abs(x - (cX + fiW)) <= 10 || Math.abs(x - (cX + cW - foW)) <= 10)) {
+            cv.style.cursor = "crosshair";
+          } else if (x <= cX + 8 || x >= cX + cW - 8) {
+            cv.style.cursor = "ew-resize";
+          } else {
+            cv.style.cursor = "grab";
+          }
+          return;
+        }
+      }
+      cv.style.cursor = "default";
+    }
+    return;
+  }
+
   switch (drag.type) {
     case "ruler": {
       if (Math.abs(x - drag.x0) > 4) {
@@ -507,6 +790,10 @@ cv.addEventListener("pointermove", (e) => {
     }
     case "vel": velMove(y); return;
     case "clip": drag.dTick = snapDelta((x - drag.x0) / ppt); if (drag.start + drag.dTick < 0) drag.dTick = -drag.start; break;
+    case "trim_start": drag.dTick = snapDelta((x - drag.x0) / ppt); break;
+    case "trim_end": drag.dTick = snapDelta((x - drag.x0) / ppt); break;
+    case "fade_in": drag.dTick = snapDelta((x - drag.x0) / ppt); break;
+    case "fade_out": drag.dTick = snapDelta((drag.x0 - x) / ppt); break;
   }
   draw();
 });
@@ -539,6 +826,33 @@ cv.addEventListener("pointerup", () => {
     case "clip":
       if (d.dTick) apply({ cmd: "move_clip", track: d.track, clip: d.clip, start: d.start + d.dTick }); else draw();
       return;
+    case "trim_start": {
+      const shift = Math.max(-d.start0, Math.min(d.dur0 - (snap <= 1 ? 30 : snap), d.dTick));
+      if (shift !== 0) {
+        const newStart = d.start0 + shift;
+        const newOffset = Math.max(0, d.off0 + shift);
+        const newDur = Math.max(30, d.dur0 - shift);
+        apply({ cmd: "trim_clip", track: d.track, clip: d.clip, start: newStart, offset_ticks: newOffset, duration_ticks: newDur });
+      } else draw();
+      return;
+    }
+    case "trim_end": {
+      const newDur = Math.max(snap <= 1 ? 30 : snap, d.dur0 + d.dTick);
+      if (newDur !== d.dur0) {
+        apply({ cmd: "trim_clip", track: d.track, clip: d.clip, duration_ticks: newDur });
+      } else draw();
+      return;
+    }
+    case "fade_in": {
+      const newFi = Math.max(0, d.orig + d.dTick);
+      apply({ cmd: "set_clip_fade", track: d.track, clip: d.clip, fade_in_ticks: newFi });
+      return;
+    }
+    case "fade_out": {
+      const newFo = Math.max(0, d.orig + d.dTick);
+      apply({ cmd: "set_clip_fade", track: d.track, clip: d.clip, fade_out_ticks: newFo });
+      return;
+    }
     default: draw();
   }
 });
@@ -546,8 +860,22 @@ cv.addEventListener("pointerup", () => {
 cv.addEventListener("dblclick", (e) => {
   const [x, y] = local(e);
   if (view === "arrange") {
-    const t = P.tracks[Math.floor((y - RULER_H + scrollY) / LANE_H)];
-    if (t && t.kind.type !== "audio") { sel = t.id; view = "roll"; scrollY = Math.max(0, (HIGH - 72) * KEY_H - 90); refresh(); }
+    const idx = Math.floor((y - RULER_H + scrollY) / LANE_H);
+    const t = P.tracks[idx];
+    if (t) {
+      if (t.kind.type === "audio") {
+        const tick = xToTick(x);
+        const c = t.clips.find((c) => tick >= c.start && tick <= c.start + clipLen(c));
+        if (c) {
+          const g = prompt("Clip Gain multiplier (0.0 - 2.0)", (c.gain || 1.0).toFixed(2));
+          if (g != null && !isNaN(+g)) apply({ cmd: "set_clip_gain", track: t.id, clip: c.id, gain: +g });
+          return;
+        }
+      } else {
+        sel = t.id; view = "roll"; scrollY = Math.max(0, (HIGH - 72) * KEY_H - 90); refresh();
+        return;
+      }
+    }
     return;
   }
   const n = noteAt(x, y), t = track();
@@ -601,7 +929,23 @@ addEventListener("keydown", (e) => {
     if (selNotes.size && t) apply({ cmd: "remove_notes", track: t.id, notes: [...selNotes] });
     else if (selClip !== null && t) { apply({ cmd: "remove_clip", track: t.id, clip: selClip }); selClip = null; }
   }
-  else if (key === "s" && !mod) { for (const n of selected()) { const at = snapRound(curTick()); if (at > n.start && at < n.start + n.duration) eng.apply(JSON.stringify({ cmd: "split_note", track: t.id, note: n.id, at })); } refresh(); }
+  else if (key === "s" && !mod) {
+    if (view === "arrange" && selClip !== null && t && t.kind.type === "audio") {
+      const at = Math.round(snapRound(curTick()));
+      const c = t.clips.find((x) => x.id === selClip);
+      if (c && at > c.start && at < c.start + clipLen(c)) {
+        apply({ cmd: "split_clip", track: t.id, clip: c.id, at });
+      }
+    } else {
+      for (const n of selected()) {
+        const at = snapRound(curTick());
+        if (at > n.start && at < n.start + n.duration) {
+          eng.apply(JSON.stringify({ cmd: "split_note", track: t.id, note: n.id, at }));
+        }
+      }
+      refresh();
+    }
+  }
   else if (key === "l") $("loop").click();
   else if (key === "m" && !mod) $("metro").click();
   else if (key === "d") $("tool-draw").click();

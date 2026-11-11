@@ -127,7 +127,8 @@ pub struct RenderOptions {
     pub metronome: bool,
 }
 
-/// Mono audio track: place every clip's asset (linear-resampled) on the timeline.
+/// Mono audio track: place every clip's asset (linear-resampled) on the timeline,
+/// respecting clip start, asset offset (start trim), duration (end trim), gain, and fades.
 fn render_audio_track(p: &Project, t: &Track, sr: u32, total: usize) -> Vec<f32> {
     let mut buf = vec![0f32; total];
     for clip in &t.clips {
@@ -136,17 +137,39 @@ fn render_audio_track(p: &Project, t: &Track, sr: u32, total: usize) -> Vec<f32>
         if data.is_empty() {
             continue;
         }
-        let ratio = asset.sample_rate as f32 / sr as f32;
+        let asset_sr = asset.sample_rate as f32;
+        let ratio = asset_sr / sr as f32;
+        let asset_offset_samples = (p.ticks_to_secs(clip.offset_ticks) * asset_sr) as usize;
+        let clip_len_ticks = p.clip_len_ticks(clip);
+        let clip_len_sec = p.ticks_to_secs(clip_len_ticks);
+        let out_len = (clip_len_sec * sr as f32) as usize;
         let off = (p.ticks_to_secs(clip.start) * sr as f32) as usize;
-        let out_len = (data.len() as f32 / ratio) as usize;
+
+        let fade_in_samples = (p.ticks_to_secs(clip.fade_in_ticks) * sr as f32) as usize;
+        let fade_out_samples = (p.ticks_to_secs(clip.fade_out_ticks) * sr as f32) as usize;
+
         for i in 0..out_len {
-            let pos = i as f32 * ratio;
+            let pos = asset_offset_samples as f32 + i as f32 * ratio;
+            if pos >= data.len() as f32 {
+                break;
+            }
             let k = pos as usize;
             let frac = pos - k as f32;
             let a = data[k.min(data.len() - 1)];
             let b = data[(k + 1).min(data.len() - 1)];
+            let raw_sample = a + (b - a) * frac;
+
+            let mut fade = 1.0f32;
+            if fade_in_samples > 0 && i < fade_in_samples {
+                fade = fade.min(i as f32 / fade_in_samples as f32);
+            }
+            if fade_out_samples > 0 && i >= out_len.saturating_sub(fade_out_samples) {
+                let rem = out_len - i;
+                fade = fade.min(rem as f32 / fade_out_samples as f32);
+            }
+
             if let Some(o) = buf.get_mut(off + i) {
-                *o += (a + (b - a) * frac) * clip.gain;
+                *o += raw_sample * clip.gain * fade;
             }
         }
     }
@@ -178,12 +201,91 @@ fn add_metronome(p: &Project, l: &mut [f32], r: &mut [f32], sr: u32) {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Meter {
+    pub peak: f32,
+    pub rms: f32,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct StereoMeter {
+    pub left: Meter,
+    pub right: Meter,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ProjectMeters {
+    pub master: StereoMeter,
+    pub tracks: std::collections::BTreeMap<u32, Meter>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TrackAudio {
+    pub id: u32,
+    pub left: Vec<f32>,
+    pub right: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FullRender {
+    pub master: Stereo,
+    pub tracks: Vec<TrackAudio>,
+}
+
+pub fn calc_meter_channel(samples: &[f32], start: usize, len: usize) -> Meter {
+    if samples.is_empty() || len == 0 || start >= samples.len() {
+        return Meter::default();
+    }
+    let end = (start + len).min(samples.len());
+    let mut peak = 0.0f32;
+    let mut sum_sq = 0.0f64;
+    let count = end - start;
+    for &s in &samples[start..end] {
+        let a = s.abs();
+        if a > peak {
+            peak = a;
+        }
+        sum_sq += (s as f64) * (s as f64);
+    }
+    Meter {
+        peak,
+        rms: (sum_sq / count.max(1) as f64).sqrt() as f32,
+    }
+}
+
+impl FullRender {
+    pub fn meters_at(&self, start: usize, len: usize) -> ProjectMeters {
+        let ml = calc_meter_channel(&self.master.left, start, len);
+        let mr = calc_meter_channel(&self.master.right, start, len);
+        let mut tracks = std::collections::BTreeMap::new();
+        for t in &self.tracks {
+            let tl = calc_meter_channel(&t.left, start, len);
+            let tr = calc_meter_channel(&t.right, start, len);
+            tracks.insert(
+                t.id,
+                Meter {
+                    peak: tl.peak.max(tr.peak),
+                    rms: ((tl.rms * tl.rms + tr.rms * tr.rms) * 0.5).sqrt(),
+                },
+            );
+        }
+        ProjectMeters {
+            master: StereoMeter { left: ml, right: mr },
+            tracks,
+        }
+    }
+}
+
 /// Render the whole project to stereo including track and master FX chains.
 pub fn render(p: &Project) -> Stereo {
     render_with(p, &RenderOptions::default())
 }
 
 pub fn render_with(p: &Project, opts: &RenderOptions) -> Stereo {
+    render_full(p, opts).master
+}
+
+pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
     let sr = p.sample_rate;
     let srf = sr as f32;
     // Tail room for delays/reverbs (extra 2 seconds)
@@ -191,6 +293,7 @@ pub fn render_with(p: &Project, opts: &RenderOptions) -> Stereo {
 
     let mut master_l: Vec<f32> = vec![0.0; total_samples];
     let mut master_r: Vec<f32> = vec![0.0; total_samples];
+    let mut rendered_tracks: Vec<TrackAudio> = Vec::new();
     let any_solo = p.tracks.iter().any(|t| t.solo);
     let ticks_per_sample = p.tempo * PPQ as f32 / 60.0 / srf;
 
@@ -234,6 +337,12 @@ pub fn render_with(p: &Project, opts: &RenderOptions) -> Stereo {
             master_l[i] += trk_l[i];
             master_r[i] += trk_r[i];
         }
+
+        rendered_tracks.push(TrackAudio {
+            id: t.id,
+            left: trk_l,
+            right: trk_r,
+        });
     }
 
     // Apply master bus FX chain
@@ -248,7 +357,10 @@ pub fn render_with(p: &Project, opts: &RenderOptions) -> Stereo {
         *s = s.tanh();
     }
 
-    Stereo { sample_rate: sr, left: master_l, right: master_r }
+    FullRender {
+        master: Stereo { sample_rate: sr, left: master_l, right: master_r },
+        tracks: rendered_tracks,
+    }
 }
 
 /// Decode WAV bytes (8/16/24/32-bit int or 32-bit float) to mono f32 + sample rate.
@@ -366,7 +478,7 @@ mod tests {
         let tone: Vec<f32> = (0..44100).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
         let asset = e.import_audio("tone", 44100, &tone);
         let a = e.apply(Command::AddTrack { name: "audio".into(), kind: TrackKind::Audio }).unwrap().track_id.unwrap();
-        e.apply(Command::AddClip { track: a, asset, start: 0, gain: None }).unwrap();
+        e.apply(Command::AddClip { track: a, asset, start: 0, gain: None, offset_ticks: None, duration_ticks: None }).unwrap();
         let i = e.apply(Command::AddTrack { name: "inst".into(), kind: TrackKind::Instrument { waveform: Waveform::Sine } }).unwrap().track_id.unwrap();
         e.apply(Command::AddNote { track: i, start: 0, duration: 480, pitch: 60, velocity: 100, lyric: None }).unwrap();
 
@@ -393,5 +505,37 @@ mod tests {
         assert_eq!(sr, 22050);
         assert_eq!(mono.len(), 100);
         assert!((mono[0] - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn clip_trim_fade_and_metering() {
+        let mut e = Engine::default();
+        let samples = vec![1.0f32; 44100]; // 1 second DC = 1.0
+        let asset = e.import_audio("dc", 44100, &samples);
+        let tr = e.apply(Command::AddTrack { name: "A".into(), kind: TrackKind::Audio }).unwrap().track_id.unwrap();
+        let cl = e.apply(Command::AddClip {
+            track: tr,
+            asset,
+            start: 0,
+            gain: Some(1.0),
+            offset_ticks: None,
+            duration_ticks: None,
+        }).unwrap().clip_id.unwrap();
+
+        // Apply fade in (half second = 480 ticks) and fade out (480 ticks)
+        e.apply(Command::SetClipFade { track: tr, clip: cl, fade_in_ticks: Some(480), fade_out_ticks: Some(480) }).unwrap();
+
+        let full = render_full(&e.project, &RenderOptions::default());
+        assert_eq!(full.tracks.len(), 1);
+        let m = full.meters_at(0, 100);
+        // Start of fade-in is near 0
+        assert!(m.master.left.peak < 0.05);
+
+        // Mid-point should have healthy level
+        let mid = full.meters_at(22050, 100);
+        assert!(mid.master.left.peak > 0.5);
+
+        // Check track meter is populated
+        assert!(m.tracks.contains_key(&tr));
     }
 }

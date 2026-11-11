@@ -19,6 +19,11 @@
     <button id="metro" title="Metronome (M)">♪ Click</button>
   </div>
   <div id="pos" title="bar : beat : tick  |  seconds">001:1:000</div>
+  <div class="meter-box" id="master-meter" title="Master Bus Output (L / R dB)">
+    <div class="meter-bar-wrap"><div class="meter-fill" id="meter-l"></div></div>
+    <div class="meter-bar-wrap"><div class="meter-fill" id="meter-r"></div></div>
+    <div class="meter-labels"><span>-24</span><span>-6</span><span>0dB</span></div>
+  </div>
   <label>BPM <input id="tempo" type="number" min="20" max="400" value="120"></label>
   <label>Sig <input id="ts-num" type="number" min="1" max="32" value="4" style="width:38px"> /
     <select id="ts-den"><option>2</option><option selected>4</option><option>8</option><option>16</option></select></label>

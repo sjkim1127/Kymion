@@ -22,7 +22,7 @@ Kymion is edited **only through JSON commands**. Never hand-edit project files.
 - Tracks: `instrument`, `vocal`, `audio`. `set_mix` has `gain/pan/mute/solo`; `rename_track`.
 - Transport/grid: `set_time_signature {numerator, denominator}`, `set_loop {start,end}` (omit both to clear).
 - Batch note edits (one undo step): `add_notes`, `remove_notes`, `move_notes {delta_tick, delta_pitch}`, `set_velocity`, `split_note`, `quantize`, `transpose`.
-- Audio: `kymion import-audio song.kymion.json clip.wav [--track ID] [--start TICK]` embeds the WAV (mono) and places a clip; then `move_clip` / `remove_clip` / `add_clip`.
+- Audio: `kymion import-audio song.kymion.json clip.wav [--track ID] [--start TICK]` embeds the WAV (mono) and places a clip; then `add_clip`, `move_clip`, `remove_clip`, `trim_clip {track, clip, start?, offset_ticks?, duration_ticks?}`, `split_clip {track, clip, at}`, `set_clip_gain {track, clip, gain}`, `set_clip_fade {track, clip, fade_in_ticks?, fade_out_ticks?}`.
 - Automation: `add_auto_point {track, param: gain|pan, tick, value}`, `clear_auto`.
 - `kymion render ... --metronome` mixes a click. Track/clip/note/asset ids share one counter.
 
@@ -37,4 +37,4 @@ Kymion is edited **only through JSON commands**. Never hand-edit project files.
 - Types: `eq` (3-band parametric), `delay` (stereo ping-pong), `reverb` (algorithmic), `compressor`.
 - Control: `set_fx` (toggle bypass, adjust parameters), `remove_fx`.
 
-In the browser GUI the same protocol is available as `window.kymion.apply(cmd)`, `.project()`, `.schema()`, `.analysis()`, `.importMidi(bytes)`, `.exportMidi()`.
+In the browser GUI the same protocol is available as `window.kymion.apply(cmd)`, `.project()`, `.schema()`, `.analysis()`, `.importMidi(bytes)`, `.exportMidi()`, `.meters()`.

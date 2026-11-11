@@ -177,7 +177,23 @@ pub struct AudioClip {
     pub asset: u32,
     /// Start position in ticks.
     pub start: u32,
+    #[serde(default = "default_gain")]
     pub gain: f32,
+    /// Offset inside the audio asset in ticks (for trimming start).
+    #[serde(default)]
+    pub offset_ticks: u32,
+    /// Length of the clip in ticks (None = play remainder of asset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ticks: Option<u32>,
+    /// Fade-in length in ticks.
+    #[serde(default)]
+    pub fade_in_ticks: u32,
+    /// Fade-out length in ticks.
+    #[serde(default)]
+    pub fade_out_ticks: u32,
+}
+fn default_gain() -> f32 {
+    1.0
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -348,10 +364,13 @@ impl Project {
         self.beat_ticks() * self.time_sig_num.max(1) as u32
     }
     pub fn clip_len_ticks(&self, clip: &AudioClip) -> u32 {
+        if let Some(d) = clip.duration_ticks {
+            return d;
+        }
         self.assets
             .iter()
             .find(|a| a.id == clip.asset)
-            .map(|a| self.secs_to_ticks(a.duration_secs()))
+            .map(|a| self.secs_to_ticks(a.duration_secs()).saturating_sub(clip.offset_ticks))
             .unwrap_or(0)
     }
     pub fn length_ticks(&self) -> u32 {
@@ -418,9 +437,43 @@ pub enum Command {
     AddAutoPoint { track: u32, param: AutoParam, tick: u32, value: f32 },
     ClearAuto { track: u32, param: AutoParam },
     /// Place an imported audio asset on an audio track.
-    AddClip { track: u32, asset: u32, start: u32, gain: Option<f32> },
+    AddClip {
+        track: u32,
+        asset: u32,
+        start: u32,
+        #[serde(default)]
+        gain: Option<f32>,
+        #[serde(default)]
+        offset_ticks: Option<u32>,
+        #[serde(default)]
+        duration_ticks: Option<u32>,
+    },
     RemoveClip { track: u32, clip: u32 },
     MoveClip { track: u32, clip: u32, start: u32 },
+    /// Trim an audio clip's start, offset into the asset, or duration.
+    TrimClip {
+        track: u32,
+        clip: u32,
+        #[serde(default)]
+        start: Option<u32>,
+        #[serde(default)]
+        offset_ticks: Option<u32>,
+        #[serde(default)]
+        duration_ticks: Option<u32>,
+    },
+    /// Split an audio clip at an absolute timeline tick inside the clip.
+    SplitClip { track: u32, clip: u32, at: u32 },
+    /// Set the gain multiplier (0..2) of an audio clip.
+    SetClipGain { track: u32, clip: u32, gain: f32 },
+    /// Set fade-in and/or fade-out lengths in ticks for an audio clip.
+    SetClipFade {
+        track: u32,
+        clip: u32,
+        #[serde(default)]
+        fade_in_ticks: Option<u32>,
+        #[serde(default)]
+        fade_out_ticks: Option<u32>,
+    },
     AddNote {
         track: u32,
         start: u32,
@@ -732,7 +785,7 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
                 AutoParam::Pan => t.pan_auto.clear(),
             }
         }
-        Command::AddClip { track, asset, start, gain } => {
+        Command::AddClip { track, asset, start, gain, offset_ticks, duration_ticks } => {
             if !p.assets.iter().any(|a| a.id == asset) {
                 return Err(Error::AssetNotFound(asset));
             }
@@ -741,7 +794,16 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
             if t.kind != TrackKind::Audio {
                 return Err(Error::Invalid("clips can only be placed on audio tracks".into()));
             }
-            t.clips.push(AudioClip { id, asset, start, gain: gain.unwrap_or(1.0).clamp(0.0, 2.0) });
+            t.clips.push(AudioClip {
+                id,
+                asset,
+                start,
+                gain: gain.unwrap_or(1.0).clamp(0.0, 2.0),
+                offset_ticks: offset_ticks.unwrap_or(0),
+                duration_ticks,
+                fade_in_ticks: 0,
+                fade_out_ticks: 0,
+            });
             out.clip_id = Some(id);
         }
         Command::RemoveClip { track, clip } => {
@@ -755,6 +817,75 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
         Command::MoveClip { track, clip, start } => {
             let t = p.track_mut(track)?;
             t.clips.iter_mut().find(|c| c.id == clip).ok_or(Error::ClipNotFound(clip))?.start = start;
+        }
+        Command::TrimClip { track, clip, start, offset_ticks, duration_ticks } => {
+            let t = p.track_mut(track)?;
+            let c = t.clips.iter_mut().find(|c| c.id == clip).ok_or(Error::ClipNotFound(clip))?;
+            if let Some(s) = start {
+                c.start = s;
+            }
+            if let Some(o) = offset_ticks {
+                c.offset_ticks = o;
+            }
+            if let Some(d) = duration_ticks {
+                if d == 0 {
+                    return Err(Error::Invalid("duration_ticks must be > 0".into()));
+                }
+                c.duration_ticks = Some(d);
+            }
+        }
+        Command::SplitClip { track, clip, at } => {
+            let (asset, gain, offset_ticks, fade_out_ticks, delta, rem) = {
+                let clip_len = {
+                    let t = p.track(track)?;
+                    let c = t.clips.iter().find(|c| c.id == clip).ok_or(Error::ClipNotFound(clip))?;
+                    p.clip_len_ticks(c)
+                };
+                let t = p.track_mut(track)?;
+                let c = t.clips.iter_mut().find(|c| c.id == clip).ok_or(Error::ClipNotFound(clip))?;
+                if at <= c.start || at >= c.start + clip_len {
+                    return Err(Error::Invalid("split point must be strictly inside the clip".into()));
+                }
+                let delta = at - c.start;
+                let rem = clip_len - delta;
+                let asset = c.asset;
+                let gain = c.gain;
+                let offset_ticks = c.offset_ticks;
+                let fade_out_ticks = c.fade_out_ticks;
+                c.duration_ticks = Some(delta);
+                c.fade_out_ticks = 0;
+                (asset, gain, offset_ticks, fade_out_ticks, delta, rem)
+            };
+            let new_id = p.alloc();
+            let tail = AudioClip {
+                id: new_id,
+                asset,
+                start: at,
+                gain,
+                offset_ticks: offset_ticks + delta,
+                duration_ticks: Some(rem),
+                fade_in_ticks: 0,
+                fade_out_ticks,
+            };
+            let t = p.track_mut(track)?;
+            t.clips.push(tail);
+            t.clips.sort_by_key(|c| c.start);
+            out.clip_id = Some(new_id);
+        }
+        Command::SetClipGain { track, clip, gain } => {
+            let t = p.track_mut(track)?;
+            let c = t.clips.iter_mut().find(|c| c.id == clip).ok_or(Error::ClipNotFound(clip))?;
+            c.gain = gain.clamp(0.0, 2.0);
+        }
+        Command::SetClipFade { track, clip, fade_in_ticks, fade_out_ticks } => {
+            let t = p.track_mut(track)?;
+            let c = t.clips.iter_mut().find(|c| c.id == clip).ok_or(Error::ClipNotFound(clip))?;
+            if let Some(fi) = fade_in_ticks {
+                c.fade_in_ticks = fi;
+            }
+            if let Some(fo) = fade_out_ticks {
+                c.fade_out_ticks = fo;
+            }
         }
         Command::AddFx { track, kind } => {
             let id = p.alloc();
@@ -868,11 +999,11 @@ mod tests {
         let mut e = Engine::default();
         let asset = e.import_audio("tone", 44100, &vec![0.5; 44100]);
         let t = e.apply(Command::AddTrack { name: "a".into(), kind: TrackKind::Audio }).unwrap().track_id.unwrap();
-        e.apply(Command::AddClip { track: t, asset, start: 480, gain: None }).unwrap();
+        e.apply(Command::AddClip { track: t, asset, start: 480, gain: None, offset_ticks: None, duration_ticks: None }).unwrap();
         // 1 second at 120bpm = 2 beats = 960 ticks
         assert_eq!(e.project.length_ticks(), 480 + 960);
         assert!(e.project.to_json_light().len() < e.project.to_json().len());
-        assert!(e.apply(Command::AddClip { track: t, asset: 999, start: 0, gain: None }).is_err());
+        assert!(e.apply(Command::AddClip { track: t, asset: 999, start: 0, gain: None, offset_ticks: None, duration_ticks: None }).is_err());
         e.apply(Command::SetLoop { start: Some(0), end: Some(1920) }).unwrap();
         assert!(e.apply(Command::SetLoop { start: Some(5), end: Some(2) }).is_err());
         e.apply(Command::SetTimeSignature { numerator: 6, denominator: 8 }).unwrap();
@@ -920,5 +1051,40 @@ mod tests {
         })
         .unwrap();
         assert!(e.project.tracks[0].fx.is_empty());
+    }
+
+    #[test]
+    fn clip_trim_split_fade_and_gain() {
+        let mut e = Engine::default();
+        let asset = e.import_audio("sample", 44100, &vec![0.8; 44100 * 2]); // 2 seconds = 1920 ticks
+        let t = e.apply(Command::AddTrack { name: "Audio".into(), kind: TrackKind::Audio }).unwrap().track_id.unwrap();
+        let c = e.apply(Command::AddClip { track: t, asset, start: 0, gain: Some(0.9), offset_ticks: None, duration_ticks: None }).unwrap().clip_id.unwrap();
+        assert_eq!(e.project.clip_len_ticks(&e.project.tracks[0].clips[0]), 1920);
+
+        // Trim duration to 960
+        e.apply(Command::TrimClip { track: t, clip: c, start: None, offset_ticks: None, duration_ticks: Some(960) }).unwrap();
+        assert_eq!(e.project.clip_len_ticks(&e.project.tracks[0].clips[0]), 960);
+
+        // Split at 480
+        let o = e.apply(Command::SplitClip { track: t, clip: c, at: 480 }).unwrap();
+        let c2 = o.clip_id.unwrap();
+        assert_eq!(e.project.tracks[0].clips.len(), 2);
+        assert_eq!(e.project.tracks[0].clips[0].duration_ticks, Some(480));
+        assert_eq!(e.project.tracks[0].clips[1].start, 480);
+        assert_eq!(e.project.tracks[0].clips[1].offset_ticks, 480);
+        assert_eq!(e.project.tracks[0].clips[1].duration_ticks, Some(480));
+
+        // Set gain & fade
+        e.apply(Command::SetClipGain { track: t, clip: c2, gain: 1.5 }).unwrap();
+        assert_eq!(e.project.tracks[0].clips[1].gain, 1.5);
+        e.apply(Command::SetClipFade { track: t, clip: c2, fade_in_ticks: Some(120), fade_out_ticks: Some(60) }).unwrap();
+        assert_eq!(e.project.tracks[0].clips[1].fade_in_ticks, 120);
+        assert_eq!(e.project.tracks[0].clips[1].fade_out_ticks, 60);
+
+        // Undo/redo
+        e.undo().unwrap(); // undo fade
+        assert_eq!(e.project.tracks[0].clips[1].fade_in_ticks, 0);
+        e.redo().unwrap();
+        assert_eq!(e.project.tracks[0].clips[1].fade_in_ticks, 120);
     }
 }
