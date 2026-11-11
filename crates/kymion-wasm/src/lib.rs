@@ -129,6 +129,11 @@ impl KymionEngine {
         self.ensure_render(false);
         serde_json::to_string(&analyze(&self.cache.as_ref().unwrap().master)).unwrap()
     }
+    /// Run comprehensive diagnostics (LUFS and frequency clashes) and return JSON report.
+    pub fn diagnose_json(&self) -> String {
+        let diag = kymion_audio::diagnose(&self.inner.project);
+        serde_json::to_string(&diag).unwrap_or_else(|_| "{}".into())
+    }
     pub fn schema() -> String {
         command_schema()
     }

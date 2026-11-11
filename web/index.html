@@ -99,6 +99,20 @@
       <button id="add-master-fx-comp">+ Master Comp</button>
     </div>
 
+    <h2>Mix Diagnostics & LUFS</h2>
+    <div id="diag-panel" class="diag-panel">
+      <div id="lufs-display" class="lufs-box">
+        <span class="lufs-val" id="lufs-val">--.- LUFS</span>
+        <span class="lufs-tag" id="lufs-tag">Ready</span>
+      </div>
+      <div style="font-size:10px;color:#888;display:flex;justify-content:space-between">
+        <span>True Peak: <b id="tp-val" style="color:#eee">--.- dBTP</b></span>
+        <span>LRA: <b id="lra-val" style="color:#eee">--.- LU</b></span>
+      </div>
+      <button id="btn-diagnose" style="width:100%;margin-top:2px">Run Mix Diagnostics</button>
+      <div id="clash-list" style="margin-top:2px"></div>
+    </div>
+
     <h2>Agent Console</h2>
     <textarea id="cmd" rows="5" spellcheck="false">{"cmd":"add_fx","track":1,"kind":{"type":"reverb","room_size":0.7,"damping":0.3,"width":1.0,"mix":0.35}}</textarea>
     <button id="run">Apply Command(s)</button>

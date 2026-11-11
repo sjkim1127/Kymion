@@ -1,9 +1,14 @@
 //! Kymion audio engine: offline renderer, mixer, DSP effects chain, analysis, WAV export.
 
 use kymion_core::{
-    eval_auto, FxInstance, FxKind, Project, SoundfontConfig, Track, TrackKind, Waveform, PPQ,
+    eval_auto, ClashSeverity, DiagnosticReport, FrequencyBand, FrequencyClash, FxInstance, FxKind,
+    LufsReport, Project, SoundfontConfig, SynthConfig, SynthFilter, Track, TrackKind, Waveform,
+    PPQ,
 };
-use kymion_dsp::{midi_to_hz, Adsr, Compressor, Eq3Band, Osc, StereoDelay, StereoReverb};
+use kymion_dsp::{
+    midi_to_hz, Adsr, AnalogAdsr, Compressor, Eq3Band, Filterbank6, KWeightingFilter, MoogLadder,
+    Osc, StateVariableFilter, StereoDelay, StereoReverb, SvfMode,
+};
 use kymion_vocal::{render_track as render_vocal, FormantVoice};
 use serde::Serialize;
 
@@ -42,35 +47,102 @@ pub struct Analysis {
     pub peak: f32,
     pub rms: f32,
     pub clipped_samples: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lufs: Option<LufsReport>,
 }
 
-fn render_instrument_into(p: &Project, t: &Track, wf: Waveform, sr: u32, buf: &mut [f32]) {
+fn render_instrument_into(
+    p: &Project,
+    t: &Track,
+    wf: Waveform,
+    synth: Option<&SynthConfig>,
+    sr: u32,
+    buf: &mut [f32],
+) {
     let srf = sr as f32;
     for n in &t.notes {
         let dur = p.ticks_to_secs(n.duration);
-        let len = ((dur + 0.35) * srf) as usize;
-        let off = (p.ticks_to_secs(n.start) * srf) as usize;
         let hz = midi_to_hz(n.pitch as f32);
-        let mut osc = Osc::default();
-        let mut env = match wf {
-            Waveform::Pluck => Adsr::new(0.002, 0.4, 0.0, 0.15, srf),
-            _ => Adsr::new(0.01, 0.1, 0.7, 0.25, srf),
-        };
         let vel = n.velocity as f32 / 127.0;
-        let note_end = (off + len).min(buf.len());
-        let count = note_end.saturating_sub(off);
-        for i in 0..count {
-            if i as f32 / srf >= dur {
-                env.gate_off();
+        let off = (p.ticks_to_secs(n.start) * srf) as usize;
+
+        if let Some(cfg) = synth {
+            let release_pad = cfg.release.max(0.1);
+            let len = ((dur + release_pad + 0.1) * srf) as usize;
+            let note_end = (off + len).min(buf.len());
+            let count = note_end.saturating_sub(off);
+
+            let mut osc = Osc::default();
+            let mut amp_env = AnalogAdsr::new(cfg.attack, cfg.decay, cfg.sustain, cfg.release, srf);
+            let mut flt_env = AnalogAdsr::new(cfg.attack, cfg.decay, cfg.sustain, cfg.release, srf);
+            let mut moog = MoogLadder::new();
+            let mut svf = StateVariableFilter::new();
+
+            for i in 0..count {
+                if i as f32 / srf >= dur {
+                    amp_env.gate_off();
+                    flt_env.gate_off();
+                }
+                let raw = match wf {
+                    Waveform::Sine => osc.sine(hz, srf),
+                    Waveform::Saw => osc.saw(hz, srf) * 0.5,
+                    Waveform::Square => osc.square(hz, srf) * 0.4,
+                    Waveform::Triangle => osc.triangle(hz, srf),
+                    Waveform::Pluck => osc.saw(hz, srf) * 0.5,
+                };
+
+                let a = amp_env.next();
+                let f_mod = flt_env.next();
+
+                let cutoff = if cfg.filter_env_amount != 0.0 {
+                    let oct = cfg.filter_env_amount * 4.0;
+                    (cfg.cutoff_hz * 2f32.powf(f_mod * oct)).clamp(20.0, srf * 0.48)
+                } else {
+                    cfg.cutoff_hz.clamp(20.0, srf * 0.48)
+                };
+
+                let filtered = match cfg.filter {
+                    SynthFilter::Moog => moog.process(raw, cutoff, cfg.resonance, srf),
+                    SynthFilter::Lowpass => {
+                        svf.process(raw, cutoff, cfg.resonance, SvfMode::Lowpass, srf)
+                    }
+                    SynthFilter::Highpass => {
+                        svf.process(raw, cutoff, cfg.resonance, SvfMode::Highpass, srf)
+                    }
+                    SynthFilter::Bandpass => {
+                        svf.process(raw, cutoff, cfg.resonance, SvfMode::Bandpass, srf)
+                    }
+                    SynthFilter::None => raw,
+                };
+
+                buf[off + i] += filtered * a * vel * 0.5;
+
+                if !amp_env.is_active() && (i as f32 / srf) >= dur {
+                    break;
+                }
             }
-            let s = match wf {
-                Waveform::Sine => osc.sine(hz, srf),
-                Waveform::Saw => osc.saw(hz, srf) * 0.5,
-                Waveform::Square => osc.square(hz, srf) * 0.4,
-                Waveform::Triangle => osc.triangle(hz, srf),
-                Waveform::Pluck => osc.saw(hz, srf) * 0.5,
+        } else {
+            let len = ((dur + 0.35) * srf) as usize;
+            let mut osc = Osc::default();
+            let mut env = match wf {
+                Waveform::Pluck => Adsr::new(0.002, 0.4, 0.0, 0.15, srf),
+                _ => Adsr::new(0.01, 0.1, 0.7, 0.25, srf),
             };
-            buf[off + i] += s * env.next() * vel * 0.5;
+            let note_end = (off + len).min(buf.len());
+            let count = note_end.saturating_sub(off);
+            for i in 0..count {
+                if i as f32 / srf >= dur {
+                    env.gate_off();
+                }
+                let s = match wf {
+                    Waveform::Sine => osc.sine(hz, srf),
+                    Waveform::Saw => osc.saw(hz, srf) * 0.5,
+                    Waveform::Square => osc.square(hz, srf) * 0.4,
+                    Waveform::Triangle => osc.triangle(hz, srf),
+                    Waveform::Pluck => osc.saw(hz, srf) * 0.5,
+                };
+                buf[off + i] += s * env.next() * vel * 0.5;
+            }
         }
     }
 }
@@ -405,9 +477,52 @@ impl TrackMeterEnvelope {
 }
 
 #[derive(Clone, Debug)]
+pub struct TrackBandEnergy {
+    pub id: u32,
+    pub name: String,
+    pub band_rms: Vec<[f32; 6]>,
+}
+
+impl TrackBandEnergy {
+    pub fn from_audio(id: u32, name: &str, left: &[f32], right: &[f32], sr: f32) -> Self {
+        let n = left.len().min(right.len());
+        let frame_samples = (0.100 * sr).max(10.0) as usize;
+        let num_frames = n / frame_samples;
+        let mut band_rms = Vec::with_capacity(num_frames);
+
+        let mut fb = Filterbank6::new(sr);
+
+        for f in 0..num_frames {
+            let start = f * frame_samples;
+            let end = start + frame_samples;
+            let mut sum_sq = [0.0f32; 6];
+            for i in start..end {
+                let mono = (left[i] + right[i]) * 0.5;
+                let bands = fb.process(mono);
+                for b in 0..6 {
+                    sum_sq[b] += bands[b] * bands[b];
+                }
+            }
+            let mut rms = [0.0f32; 6];
+            for b in 0..6 {
+                rms[b] = (sum_sq[b] / frame_samples as f32).sqrt();
+            }
+            band_rms.push(rms);
+        }
+
+        Self {
+            id,
+            name: name.to_string(),
+            band_rms,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct FullRender {
     pub master: Stereo,
     pub track_meters: Vec<TrackMeterEnvelope>,
+    pub track_energies: Vec<TrackBandEnergy>,
 }
 
 pub fn calc_meter_channel(samples: &[f32], start: usize, len: usize) -> Meter {
@@ -473,6 +588,7 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
     let mut trk_r: Vec<f32> = vec![0.0; total_samples];
 
     let mut track_meters: Vec<TrackMeterEnvelope> = Vec::new();
+    let mut track_energies: Vec<TrackBandEnergy> = Vec::new();
     let any_solo = p.tracks.iter().any(|t| t.solo);
     let ticks_per_sample = p.tempo * PPQ as f32 / 60.0 / srf;
 
@@ -486,12 +602,13 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
             TrackKind::Instrument {
                 waveform,
                 soundfont,
+                synth,
             } => {
                 if let Some(sf_cfg) = soundfont {
                     render_soundfont_into(p, t, sf_cfg, sr, &mut trk_l, &mut trk_r);
                     is_stereo = true;
                 } else {
-                    render_instrument_into(p, t, *waveform, sr, &mut mono);
+                    render_instrument_into(p, t, *waveform, synth.as_ref(), sr, &mut mono);
                 }
             }
             TrackKind::Vocal { .. } => {
@@ -549,6 +666,9 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
         }
 
         track_meters.push(TrackMeterEnvelope::from_audio(t.id, &trk_l, &trk_r));
+        track_energies.push(TrackBandEnergy::from_audio(
+            t.id, &t.name, &trk_l, &trk_r, srf,
+        ));
     }
 
     // Apply master bus FX chain
@@ -570,6 +690,7 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
             right: master_r,
         },
         track_meters,
+        track_energies,
     }
 }
 
@@ -597,6 +718,296 @@ pub fn decode_wav(bytes: &[u8]) -> Result<(u32, Vec<f32>), String> {
     Ok((spec.sample_rate, mono))
 }
 
+pub fn detect_frequency_clashes(energies: &[TrackBandEnergy]) -> Vec<FrequencyClash> {
+    let mut clashes = Vec::new();
+    let num_tracks = energies.len();
+    if num_tracks < 2 {
+        return clashes;
+    }
+
+    for i in 0..num_tracks {
+        for j in (i + 1)..num_tracks {
+            let a = &energies[i];
+            let b = &energies[j];
+            let num_frames = a.band_rms.len().min(b.band_rms.len());
+            if num_frames == 0 {
+                continue;
+            }
+
+            for band_idx in 0..6 {
+                let mut clash_frames = 0usize;
+                let mut sum_overlap = 0.0f32;
+
+                for f in 0..num_frames {
+                    let ea = a.band_rms[f][band_idx];
+                    let eb = b.band_rms[f][band_idx];
+
+                    let tot_a: f32 = a.band_rms[f].iter().sum();
+                    let tot_b: f32 = b.band_rms[f].iter().sum();
+
+                    if tot_a > 0.005 && tot_b > 0.005 {
+                        let share_a = ea / tot_a;
+                        let share_b = eb / tot_b;
+
+                        // Clash occurs if both tracks concentrate significant energy in this band (>18%),
+                        // or if their absolute levels in this band are comparable and audible.
+                        let is_spectral_clash =
+                            share_a > 0.18 && share_b > 0.18 && ea > 0.002 && eb > 0.002;
+                        let is_level_clash =
+                            ea > 0.005 && eb > 0.005 && (ea.min(eb) / ea.max(eb)) > 0.35;
+
+                        if is_spectral_clash || is_level_clash {
+                            let overlap = (share_a.min(share_b) / share_a.max(share_b))
+                                .max(ea.min(eb) / ea.max(eb));
+                            clash_frames += 1;
+                            sum_overlap += overlap;
+                        }
+                    }
+                }
+
+                // Minimum threshold: 1.0 second of sustained overlap (10 frames @ 100ms)
+                if clash_frames >= 10 {
+                    let avg_overlap = sum_overlap / clash_frames as f32;
+                    let duration_sec = clash_frames as f32 * 0.1;
+                    let band = FrequencyBand::ALL[band_idx];
+                    let (f_low, f_high) = band.freq_range_hz();
+
+                    let severity = if avg_overlap > 0.75 && duration_sec >= 3.0 {
+                        ClashSeverity::High
+                    } else if avg_overlap > 0.60 || duration_sec >= 4.0 {
+                        ClashSeverity::Medium
+                    } else {
+                        ClashSeverity::Low
+                    };
+
+                    let suggestion = match band {
+                        FrequencyBand::SubBass | FrequencyBand::Bass => {
+                            format!(
+                                "Tracks '{}' and '{}' compete in the {} ({:.0}-{:.0} Hz) for {:.1}s. Apply sidechain ducking on '{}' triggered by '{}', or high-pass filter.",
+                                a.name, b.name, band.label(), f_low, f_high, duration_sec, b.name, a.name
+                            )
+                        }
+                        FrequencyBand::LowMid => {
+                            format!(
+                                "Muddiness detected between '{}' and '{}' in {} ({:.0}-{:.0} Hz) for {:.1}s. Carve out 250-400 Hz by 2~3 dB with EQ on the background track.",
+                                a.name, b.name, band.label(), f_low, f_high, duration_sec
+                            )
+                        }
+                        FrequencyBand::Mid | FrequencyBand::HighMid => {
+                            format!(
+                                "Masking clash between '{}' and '{}' in {} ({:.0}-{:.0} Hz) for {:.1}s. Pan tracks apart or carve out competing frequencies with EQ notch on '{}'.",
+                                a.name, b.name, band.label(), f_low, f_high, duration_sec, b.name
+                            )
+                        }
+                        FrequencyBand::High => {
+                            format!(
+                                "High-frequency buildup between '{}' and '{}' in {} ({:.0}-{:.0} Hz) for {:.1}s. Consider high-shelf attenuation or gentle de-essing.",
+                                a.name, b.name, band.label(), f_low, f_high, duration_sec
+                            )
+                        }
+                    };
+
+                    clashes.push(FrequencyClash {
+                        track_a_id: a.id,
+                        track_a_name: a.name.clone(),
+                        track_b_id: b.id,
+                        track_b_name: b.name.clone(),
+                        band,
+                        freq_range_hz: (f_low, f_high),
+                        severity,
+                        overlap_score: (avg_overlap * 100.0).round() / 100.0,
+                        clash_duration_sec: (duration_sec * 10.0).round() / 10.0,
+                        suggestion,
+                    });
+                }
+            }
+        }
+    }
+
+    clashes.sort_by(|x, y| {
+        let score = |s: ClashSeverity| match s {
+            ClashSeverity::High => 3,
+            ClashSeverity::Medium => 2,
+            ClashSeverity::Low => 1,
+        };
+        score(y.severity).cmp(&score(x.severity)).then_with(|| {
+            y.overlap_score
+                .partial_cmp(&x.overlap_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    clashes
+}
+
+/// Calculate ITU-R BS.1770-4 gated integrated loudness (LUFS), momentary max, short-term max, LRA, and True Peak.
+pub fn calc_lufs(s: &Stereo) -> LufsReport {
+    let srf = s.sample_rate as f32;
+    let n = s.left.len().min(s.right.len());
+    if n == 0 {
+        return LufsReport::default();
+    }
+
+    let mut k_l = KWeightingFilter::new(srf);
+    let mut k_r = KWeightingFilter::new(srf);
+    let mut filtered_l = Vec::with_capacity(n);
+    let mut filtered_r = Vec::with_capacity(n);
+
+    let mut true_peak = 0.0f32;
+    for i in 0..n {
+        let sl = s.left[i];
+        let sr_samp = s.right[i];
+        true_peak = true_peak.max(sl.abs()).max(sr_samp.abs());
+
+        // 4x linear oversampling for inter-sample peak detection
+        if i + 1 < n {
+            let next_l = s.left[i + 1];
+            let next_r = s.right[i + 1];
+            for k in 1..4 {
+                let frac = k as f32 / 4.0;
+                let inter_l = sl + (next_l - sl) * frac;
+                let inter_r = sr_samp + (next_r - sr_samp) * frac;
+                true_peak = true_peak.max(inter_l.abs()).max(inter_r.abs());
+            }
+        }
+
+        filtered_l.push(k_l.process(sl));
+        filtered_r.push(k_r.process(sr_samp));
+    }
+
+    let true_peak_db = if true_peak > 1e-6 {
+        20.0 * true_peak.log10()
+    } else {
+        -120.0
+    };
+
+    let block_size = (0.400 * srf).max(16.0) as usize;
+    let hop_size = (0.100 * srf).max(4.0) as usize;
+
+    if n < block_size {
+        let mut sum_sq = 0.0f64;
+        for i in 0..n {
+            sum_sq += (filtered_l[i] as f64).powi(2) + (filtered_r[i] as f64).powi(2);
+        }
+        let mean_sq = sum_sq / (2 * n) as f64;
+        let lkfs = if mean_sq > 1e-12 {
+            -0.691 + 10.0 * mean_sq.log10() as f32
+        } else {
+            -70.0
+        };
+        return LufsReport {
+            integrated: lkfs,
+            momentary_max: lkfs,
+            short_term_max: lkfs,
+            loudness_range: 0.0,
+            true_peak_db,
+        };
+    }
+
+    let mut z_blocks: Vec<f64> = Vec::new();
+    let mut momentary_max = -120.0f32;
+
+    let mut start = 0;
+    while start + block_size <= n {
+        let mut sum_sq = 0.0f64;
+        for i in start..start + block_size {
+            sum_sq += (filtered_l[i] as f64).powi(2) + (filtered_r[i] as f64).powi(2);
+        }
+        let z = sum_sq / (2 * block_size) as f64;
+        z_blocks.push(z);
+
+        let m_loudness = if z > 1e-12 {
+            -0.691 + 10.0 * z.log10() as f32
+        } else {
+            -70.0
+        };
+        momentary_max = momentary_max.max(m_loudness);
+
+        start += hop_size;
+    }
+
+    let st_blocks = 30.min(z_blocks.len());
+    let mut short_term_max = -120.0f32;
+    let mut st_values: Vec<f32> = Vec::new();
+
+    if z_blocks.len() >= st_blocks {
+        let mut window_sum: f64 = z_blocks[..st_blocks].iter().sum();
+        let val = -0.691 + 10.0 * (window_sum / st_blocks as f64).max(1e-12).log10() as f32;
+        short_term_max = short_term_max.max(val);
+        st_values.push(val);
+
+        for i in st_blocks..z_blocks.len() {
+            window_sum += z_blocks[i] - z_blocks[i - st_blocks];
+            let val = -0.691 + 10.0 * (window_sum / st_blocks as f64).max(1e-12).log10() as f32;
+            short_term_max = short_term_max.max(val);
+            st_values.push(val);
+        }
+    } else {
+        short_term_max = momentary_max;
+    }
+
+    // Two-stage gating for integrated loudness per BS.1770-4
+    let mut abs_gated: Vec<f64> = Vec::new();
+    for &z in &z_blocks {
+        let l = -0.691 + 10.0 * z.max(1e-12).log10() as f32;
+        if l > -70.0 {
+            abs_gated.push(z);
+        }
+    }
+
+    if abs_gated.is_empty() {
+        return LufsReport {
+            integrated: -70.0,
+            momentary_max: momentary_max.max(-70.0),
+            short_term_max: short_term_max.max(-70.0),
+            loudness_range: 0.0,
+            true_peak_db,
+        };
+    }
+
+    let mean_z_abs: f64 = abs_gated.iter().sum::<f64>() / abs_gated.len() as f64;
+    let l_abs = -0.691 + 10.0 * mean_z_abs.max(1e-12).log10() as f32;
+
+    let gamma_rel = l_abs - 10.0;
+    let mut rel_gated: Vec<f64> = Vec::new();
+    for &z in &abs_gated {
+        let l = -0.691 + 10.0 * z.max(1e-12).log10() as f32;
+        if l > gamma_rel {
+            rel_gated.push(z);
+        }
+    }
+
+    let integrated = if !rel_gated.is_empty() {
+        let mean_z_rel = rel_gated.iter().sum::<f64>() / rel_gated.len() as f64;
+        -0.691 + 10.0 * mean_z_rel.max(1e-12).log10() as f32
+    } else {
+        l_abs
+    };
+
+    // Loudness Range (LRA) per EBU R128
+    let mut valid_st: Vec<f32> = st_values
+        .into_iter()
+        .filter(|&v| v > -70.0 && v > (integrated - 20.0))
+        .collect();
+    valid_st.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let loudness_range = if valid_st.len() >= 10 {
+        let idx_10 = (valid_st.len() as f32 * 0.10) as usize;
+        let idx_95 = (valid_st.len() as f32 * 0.95).min((valid_st.len() - 1) as f32) as usize;
+        (valid_st[idx_95] - valid_st[idx_10]).max(0.0)
+    } else {
+        0.0
+    };
+
+    LufsReport {
+        integrated: (integrated * 10.0).round() / 10.0,
+        momentary_max: (momentary_max * 10.0).round() / 10.0,
+        short_term_max: (short_term_max * 10.0).round() / 10.0,
+        loudness_range: (loudness_range * 10.0).round() / 10.0,
+        true_peak_db: (true_peak_db * 10.0).round() / 10.0,
+    }
+}
+
 pub fn analyze(s: &Stereo) -> Analysis {
     let n = s.left.len().max(1);
     let (mut peak, mut sum, mut clip) = (0f32, 0f64, 0usize);
@@ -607,11 +1018,52 @@ pub fn analyze(s: &Stereo) -> Analysis {
             clip += 1;
         }
     }
+    let lufs = Some(calc_lufs(s));
     Analysis {
         duration_sec: n as f32 / s.sample_rate as f32,
         peak,
         rms: (sum / (2 * n) as f64).sqrt() as f32,
         clipped_samples: clip,
+        lufs,
+    }
+}
+
+/// Comprehensive mixing diagnostics for AI agents and audio engineers.
+pub fn diagnose(p: &Project) -> DiagnosticReport {
+    let full = render_full(p, &RenderOptions::default());
+    let lufs = calc_lufs(&full.master);
+    let clashes = detect_frequency_clashes(&full.track_energies);
+
+    let mut summary = format!(
+        "Loudness: {:.1} LUFS (Integrated), Peak: {:.1} dBTP, LRA: {:.1} LU.",
+        lufs.integrated, lufs.true_peak_db, lufs.loudness_range
+    );
+
+    if lufs.integrated > -12.0 {
+        summary.push_str(
+            " Warning: Master is loud (> -12 LUFS); streaming services will attenuate it.",
+        );
+    } else if lufs.integrated < -18.0 {
+        summary.push_str(
+            " Note: Master is quiet (< -18 LUFS); consider gentle compression or makeup gain.",
+        );
+    } else {
+        summary.push_str(" Optimal loudness for streaming platforms (-14 ± 2 LUFS).");
+    }
+
+    if clashes.is_empty() {
+        summary.push_str(" Zero frequency masking clashes detected across all tracks.");
+    } else {
+        summary.push_str(&format!(
+            " Found {} frequency masking clash(es) requiring EQ or sidechain adjustments.",
+            clashes.len()
+        ));
+    }
+
+    DiagnosticReport {
+        lufs,
+        clashes,
+        summary,
     }
 }
 
@@ -821,5 +1273,81 @@ mod tests {
 
         // Check track meter is populated
         assert!(m.tracks.contains_key(&tr));
+    }
+
+    #[test]
+    fn synth_ladder_and_lufs_diagnostics() {
+        let mut e = Engine::default();
+        let t1 = e
+            .apply(Command::AddTrack {
+                name: "Moog Bass".into(),
+                kind: TrackKind::synth(
+                    Waveform::Saw,
+                    SynthConfig {
+                        filter: SynthFilter::Moog,
+                        cutoff_hz: 600.0,
+                        resonance: 0.7,
+                        filter_env_amount: 0.6,
+                        attack: 0.005,
+                        decay: 0.15,
+                        sustain: 0.3,
+                        release: 0.2,
+                    },
+                ),
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
+
+        // Add 8 quarter notes
+        for beat in 0..8 {
+            e.apply(Command::AddNote {
+                track: t1,
+                start: beat * 480,
+                duration: 460,
+                pitch: 36, // C2 bass note
+                velocity: 110,
+                lyric: None,
+            })
+            .unwrap();
+        }
+
+        let s = render(&e.project);
+        let a = analyze(&s);
+        assert!(a.peak > 0.05);
+        assert!(a.lufs.is_some());
+        let lufs = a.lufs.unwrap();
+        assert!(lufs.integrated.is_finite());
+        assert!(lufs.true_peak_db.is_finite());
+
+        // Add a second competing bass track playing in the exact same frequency range
+        let t2 = e
+            .apply(Command::AddTrack {
+                name: "Sub Synth".into(),
+                kind: TrackKind::instrument(Waveform::Sine),
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
+
+        for beat in 0..8 {
+            e.apply(Command::AddNote {
+                track: t2,
+                start: beat * 480,
+                duration: 460,
+                pitch: 38, // D2 bass note
+                velocity: 110,
+                lyric: None,
+            })
+            .unwrap();
+        }
+
+        let diag = diagnose(&e.project);
+        assert!(!diag.summary.is_empty());
+        // Verify frequency clashes are detected between the two competing bass tracks
+        assert!(!diag.clashes.is_empty());
+        assert_eq!(diag.clashes[0].track_a_id, t1);
+        assert_eq!(diag.clashes[0].track_b_id, t2);
+        assert!(diag.clashes[0].suggestion.contains("compete"));
     }
 }

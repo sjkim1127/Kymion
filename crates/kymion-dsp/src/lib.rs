@@ -270,8 +270,96 @@ impl Adsr {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdsrStage {
+    Idle,
+    Attack,
+    Decay,
+    Sustain,
+    Release,
+}
+
+/// Analog exponential ADSR envelope with punchy attack and smooth musical release.
+#[derive(Clone, Debug)]
+pub struct AnalogAdsr {
+    attack_coef: f32,
+    decay_coef: f32,
+    sustain_lvl: f32,
+    release_coef: f32,
+    stage: AdsrStage,
+    level: f32,
+}
+
+impl AnalogAdsr {
+    pub fn new(attack_s: f32, decay_s: f32, sustain: f32, release_s: f32, sr: f32) -> Self {
+        let sr = sr.max(1.0);
+        let attack_s = attack_s.max(0.0005);
+        let decay_s = decay_s.max(0.001);
+        let release_s = release_s.max(0.001);
+        let sustain = sustain.clamp(0.0, 1.0);
+
+        let attack_coef = 1.0 - (-1.0 / (attack_s * sr * 0.35)).exp();
+        let decay_coef = 1.0 - (-1.0 / (decay_s * sr * 0.3)).exp();
+        let release_coef = 1.0 - (-1.0 / (release_s * sr * 0.3)).exp();
+
+        Self {
+            attack_coef,
+            decay_coef,
+            sustain_lvl: sustain,
+            release_coef,
+            stage: AdsrStage::Attack,
+            level: 0.0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn gate_off(&mut self) {
+        if self.stage != AdsrStage::Idle {
+            self.stage = AdsrStage::Release;
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_active(&self) -> bool {
+        self.stage != AdsrStage::Idle
+    }
+
+    #[inline(always)]
+    pub fn next(&mut self) -> f32 {
+        match self.stage {
+            AdsrStage::Idle => 0.0,
+            AdsrStage::Attack => {
+                // Target slightly above 1.0 (1.2) for fast punchy analog rise
+                self.level += self.attack_coef * (1.2 - self.level);
+                if self.level >= 1.0 {
+                    self.level = 1.0;
+                    self.stage = AdsrStage::Decay;
+                }
+                self.level
+            }
+            AdsrStage::Decay => {
+                self.level += self.decay_coef * (self.sustain_lvl - self.level);
+                if (self.level - self.sustain_lvl).abs() < 1e-4 {
+                    self.level = self.sustain_lvl;
+                    self.stage = AdsrStage::Sustain;
+                }
+                self.level
+            }
+            AdsrStage::Sustain => self.level,
+            AdsrStage::Release => {
+                self.level += self.release_coef * (0.0 - self.level);
+                if self.level < 1e-3 {
+                    self.level = 0.0;
+                    self.stage = AdsrStage::Idle;
+                }
+                self.level
+            }
+        }
+    }
+}
+
 /// Resonant biquad filter (RBJ Audio EQ Cookbook).
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Biquad {
     b0: f32,
     b1: f32,
@@ -283,6 +371,17 @@ pub struct Biquad {
 }
 
 impl Biquad {
+    pub fn raw(b0: f32, b1: f32, b2: f32, a1: f32, a2: f32) -> Self {
+        Self {
+            b0,
+            b1,
+            b2,
+            a1,
+            a2,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
     pub fn bandpass(freq: f32, q: f32, sr: f32) -> Self {
         let mut b = Self::default();
         b.set_bandpass(freq, q, sr);
@@ -307,6 +406,21 @@ impl Biquad {
             b0: (1.0 - c) / 2.0 / a0,
             b1: (1.0 - c) / a0,
             b2: (1.0 - c) / 2.0 / a0,
+            a1: -2.0 * c / a0,
+            a2: (1.0 - alpha) / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+    pub fn highpass(freq: f32, q: f32, sr: f32) -> Self {
+        let w = TAU * freq.clamp(20.0, sr * 0.45) / sr;
+        let alpha = w.sin() / (2.0 * q.max(0.1));
+        let a0 = 1.0 + alpha;
+        let c = w.cos();
+        Self {
+            b0: (1.0 + c) / 2.0 / a0,
+            b1: -(1.0 + c) / a0,
+            b2: (1.0 + c) / 2.0 / a0,
             a1: -2.0 * c / a0,
             a2: (1.0 - alpha) / a0,
             z1: 0.0,
@@ -402,6 +516,178 @@ impl Eq3Band {
     #[inline(always)]
     pub fn process(&mut self, x: f32) -> f32 {
         self.high.process(self.mid.process(self.low.process(x)))
+    }
+}
+
+/// Filter mode for the zero-delay feedback State-Variable Filter (SVF).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SvfMode {
+    #[default]
+    Lowpass,
+    Highpass,
+    Bandpass,
+    Notch,
+}
+
+/// Zero-delay feedback State Variable Filter (TPT SVF, Andrew Simper).
+/// Unconditionally stable with clean frequency response from 20Hz to Nyquist.
+#[derive(Clone, Debug, Default)]
+pub struct StateVariableFilter {
+    s1: f32,
+    s2: f32,
+}
+
+impl StateVariableFilter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline(always)]
+    pub fn process(
+        &mut self,
+        input: f32,
+        cutoff_hz: f32,
+        resonance: f32,
+        mode: SvfMode,
+        sr: f32,
+    ) -> f32 {
+        let g = (std::f32::consts::PI * cutoff_hz.clamp(10.0, sr * 0.48) / sr).tan();
+        let q = 0.5 / (1.0 - resonance.clamp(0.0, 0.98) * 0.98).max(0.01);
+        let k = 1.0 / q;
+        let a1 = 1.0 / (1.0 + g * (g + k));
+        let a2 = g * a1;
+        let a3 = g * a2;
+        let v3 = input - self.s2;
+        let v1 = a1 * self.s1 + a2 * v3;
+        let v2 = self.s2 + a2 * self.s1 + a3 * v3;
+        self.s1 = 2.0 * v1 - self.s1;
+        self.s2 = 2.0 * v2 - self.s2;
+        match mode {
+            SvfMode::Lowpass => v2,
+            SvfMode::Bandpass => v1,
+            SvfMode::Highpass => input - k * v1 - v2,
+            SvfMode::Notch => input - k * v1,
+        }
+    }
+}
+
+/// 4-pole (24dB/octave) Moog-style resonant ladder filter with non-linear saturation.
+#[derive(Clone, Debug, Default)]
+pub struct MoogLadder {
+    s: [f32; 4],
+}
+
+impl MoogLadder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline(always)]
+    pub fn process(&mut self, input: f32, cutoff_hz: f32, resonance: f32, sr: f32) -> f32 {
+        let wc = (TAU * cutoff_hz.clamp(10.0, sr * 0.45) / sr).min(1.5);
+        let f = (wc * 0.5).tan().clamp(0.0001, 0.999);
+        let res = resonance.clamp(0.0, 0.98) * 3.98;
+
+        // Feedback with soft tanh saturation for classic warm analog warmth
+        let fb = self.s[3];
+        let u = (input - res * fb).tanh();
+
+        self.s[0] += f * (u - self.s[0]);
+        self.s[1] += f * (self.s[0] - self.s[1]);
+        self.s[2] += f * (self.s[1] - self.s[2]);
+        self.s[3] += f * (self.s[2] - self.s[3]);
+
+        // Makeup gain to compensate for passband loss when resonance is high
+        let makeup = 1.0 + 0.5 * res;
+        self.s[3] * makeup
+    }
+}
+
+/// 2-stage K-weighting filter per ITU-R BS.1770-4 for LUFS measurement.
+/// Stage 1: High shelf filter simulating head acoustic effect (+4dB boost @ 1.5kHz).
+/// Stage 2: High-pass RLB weighting filter (~100Hz 2nd order HPF).
+#[derive(Clone, Debug)]
+pub struct KWeightingFilter {
+    pre: Biquad,
+    rlb: Biquad,
+}
+
+impl KWeightingFilter {
+    pub fn new(sr: f32) -> Self {
+        let sr = sr.max(8000.0);
+        // Stage 1: High shelf
+        let f0_pre = 1681.97445;
+        let g_db_pre = 3.99984385;
+        let q_pre = 0.707175237;
+
+        let k_pre = (std::f32::consts::PI * f0_pre / sr).tan();
+        let vh = 10f32.powf(g_db_pre / 20.0);
+        let a0_pre = 1.0 + k_pre / q_pre + k_pre * k_pre;
+        let b0_pre = (vh + (vh.sqrt() * k_pre) / q_pre + k_pre * k_pre) / a0_pre;
+        let b1_pre = (2.0 * (k_pre * k_pre - vh)) / a0_pre;
+        let b2_pre = (vh - (vh.sqrt() * k_pre) / q_pre + k_pre * k_pre) / a0_pre;
+        let a1_pre = (2.0 * (k_pre * k_pre - 1.0)) / a0_pre;
+        let a2_pre = (1.0 - k_pre / q_pre + k_pre * k_pre) / a0_pre;
+
+        let pre = Biquad::raw(b0_pre, b1_pre, b2_pre, a1_pre, a2_pre);
+
+        // Stage 2: High-pass RLB weighting
+        let f0_rlb = 38.13547;
+        let q_rlb = 0.500327037;
+
+        let k_rlb = (std::f32::consts::PI * f0_rlb / sr).tan();
+        let a0_rlb = 1.0 + k_rlb / q_rlb + k_rlb * k_rlb;
+        let b0_rlb = 1.0 / a0_rlb;
+        let b1_rlb = -2.0 / a0_rlb;
+        let b2_rlb = 1.0 / a0_rlb;
+        let a1_rlb = (2.0 * (k_rlb * k_rlb - 1.0)) / a0_rlb;
+        let a2_rlb = (1.0 - k_rlb / q_rlb + k_rlb * k_rlb) / a0_rlb;
+
+        let rlb = Biquad::raw(b0_rlb, b1_rlb, b2_rlb, a1_rlb, a2_rlb);
+
+        Self { pre, rlb }
+    }
+
+    #[inline(always)]
+    pub fn process(&mut self, x: f32) -> f32 {
+        self.rlb.process(self.pre.process(x))
+    }
+}
+
+/// 6-band audio filterbank for frequency spectrum & masking analysis.
+/// Bands: [SubBass (<60Hz), Bass (60-250Hz), LowMid (250-500Hz), Mid (500-2kHz), HighMid (2-6kHz), High (>6kHz)]
+#[derive(Clone, Debug)]
+pub struct Filterbank6 {
+    b0: Biquad, // Lowpass 60Hz
+    b1: Biquad, // Bandpass 60-250Hz (center 122Hz, Q 0.7)
+    b2: Biquad, // Bandpass 250-500Hz (center 353Hz, Q 1.4)
+    b3: Biquad, // Bandpass 500-2000Hz (center 1000Hz, Q 0.67)
+    b4: Biquad, // Bandpass 2000-6000Hz (center 3464Hz, Q 0.86)
+    b5: Biquad, // Highpass 6000Hz
+}
+
+impl Filterbank6 {
+    pub fn new(sr: f32) -> Self {
+        Self {
+            b0: Biquad::lowpass(60.0, 0.707, sr),
+            b1: Biquad::bandpass(122.0, 0.7, sr),
+            b2: Biquad::bandpass(353.0, 1.4, sr),
+            b3: Biquad::bandpass(1000.0, 0.67, sr),
+            b4: Biquad::bandpass(3464.0, 0.86, sr),
+            b5: Biquad::highpass(6000.0, 0.707, sr),
+        }
+    }
+
+    #[inline(always)]
+    pub fn process(&mut self, x: f32) -> [f32; 6] {
+        [
+            self.b0.process(x),
+            self.b1.process(x),
+            self.b2.process(x),
+            self.b3.process(x),
+            self.b4.process(x),
+            self.b5.process(x),
+        ]
     }
 }
 
@@ -732,5 +1018,77 @@ mod tests {
         let mut rev = StereoReverb::new(0.8, 0.3, 1.0, 0.35, 44100.0);
         let (rl, rr) = rev.process(0.8, 0.8);
         assert!(rl.is_finite() && rr.is_finite());
+    }
+
+    #[test]
+    fn analog_adsr_behavior() {
+        let mut env = AnalogAdsr::new(0.01, 0.05, 0.5, 0.05, 44100.0);
+        let mut max_val = 0.0f32;
+        for _ in 0..1000 {
+            let v = env.next();
+            assert!((0.0..=1.2).contains(&v) && v.is_finite());
+            if v > max_val {
+                max_val = v;
+            }
+        }
+        assert!(max_val >= 0.95);
+        env.gate_off();
+        for _ in 0..10000 {
+            let v = env.next();
+            assert!(v >= 0.0 && v.is_finite());
+        }
+        assert_eq!(env.next(), 0.0);
+        assert!(!env.is_active());
+    }
+
+    #[test]
+    fn moog_ladder_stability() {
+        let mut moog = MoogLadder::new();
+        for i in 0..10000 {
+            let x = ((i as f32 * 0.1).sin()).clamp(-1.0, 1.0);
+            let y = moog.process(x, 1000.0, 0.8, 44100.0);
+            assert!(
+                y.is_finite(),
+                "Moog ladder produced non-finite output at sample {}",
+                i
+            );
+            assert!(y.abs() <= 2.0, "Moog ladder blew up: {}", y);
+        }
+    }
+
+    #[test]
+    fn svf_modes_stability() {
+        let mut svf = StateVariableFilter::new();
+        for mode in [
+            SvfMode::Lowpass,
+            SvfMode::Highpass,
+            SvfMode::Bandpass,
+            SvfMode::Notch,
+        ] {
+            for i in 0..1000 {
+                let x = if i % 2 == 0 { 0.5 } else { -0.5 };
+                let y = svf.process(x, 800.0, 0.7, mode, 44100.0);
+                assert!(y.is_finite());
+            }
+        }
+    }
+
+    #[test]
+    fn k_weighting_filter_smoke() {
+        let mut kw = KWeightingFilter::new(48000.0);
+        for i in 0..1000 {
+            let x = (i as f32 * 0.05).sin();
+            let y = kw.process(x);
+            assert!(y.is_finite());
+        }
+    }
+
+    #[test]
+    fn filterbank6_smoke() {
+        let mut fb = Filterbank6::new(44100.0);
+        let bands = fb.process(0.5);
+        for b in bands {
+            assert!(b.is_finite());
+        }
     }
 }

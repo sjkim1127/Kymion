@@ -244,3 +244,96 @@ button.active { background: #3a3a22; border-color: var(--gold); color: #fff; }
   font-size: 9px;
   color: #bbb;
 }
+
+/* Synth & Diagnostics Panels */
+.synth-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  background: #141419;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 6px 8px;
+}
+.synth-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.synth-field label {
+  font-size: 9px;
+  text-transform: uppercase;
+  color: #888;
+  display: flex;
+  justify-content: space-between;
+}
+.synth-field input[type=range] {
+  width: 100%;
+  height: 12px;
+  accent-color: var(--gold);
+}
+.diag-panel {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.lufs-box {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #101016;
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-family: monospace;
+}
+.lufs-val {
+  font-size: 14px;
+  font-weight: bold;
+  color: #6fcf97;
+}
+.lufs-tag {
+  font-size: 9px;
+  padding: 2px 5px;
+  border-radius: 3px;
+  background: #252532;
+  color: #aaa;
+}
+.clash-card {
+  background: #191414;
+  border: 1px solid #4a2222;
+  border-radius: 4px;
+  padding: 6px;
+  margin-top: 4px;
+  font-size: 11px;
+}
+.clash-header {
+  display: flex;
+  justify-content: space-between;
+  font-weight: bold;
+  color: #eb5757;
+  font-size: 10px;
+}
+.clash-card.med {
+  border-color: #5a4422;
+  background: #191714;
+}
+.clash-card.med .clash-header {
+  color: #f2c94c;
+}
+.clash-card.low {
+  border-color: #22384a;
+  background: #141719;
+}
+.clash-card.low .clash-header {
+  color: #4aa3c9;
+}
+.clash-desc {
+  color: #ccc;
+  margin-top: 3px;
+  font-size: 10px;
+  line-height: 1.3;
+}

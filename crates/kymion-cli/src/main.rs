@@ -67,6 +67,8 @@ enum Cmd {
     },
     /// Render and report peak/RMS/clipping/duration (verify without listening).
     Analyze { path: PathBuf },
+    /// Diagnose project acoustics, ITU-R BS.1770 LUFS loudness, and frequency masking clashes.
+    Diagnose { path: PathBuf },
     /// Import a WAV file as an audio asset and place it as a clip.
     ImportAudio {
         project: PathBuf,
@@ -213,6 +215,11 @@ fn run(cli: Cli) -> Result<Value, String> {
         Cmd::Analyze { path } => Ok(
             json!({"ok": true, "analysis": analyze(&render_with(&load(&path)?, &RenderOptions::default()))}),
         ),
+        Cmd::Diagnose { path } => {
+            let p = load(&path)?;
+            let report = kymion_audio::diagnose(&p);
+            Ok(json!({"ok": true, "diagnostic": report}))
+        }
         Cmd::ImportAudio {
             project,
             wav,

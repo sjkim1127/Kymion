@@ -251,6 +251,50 @@ function renderInstrumentPanel() {
       html += `<option value="${wf}" ${t.kind.waveform === wf ? "selected" : ""}>${wf.toUpperCase()}</option>`;
     }
     html += `</select></div>`;
+
+    const synth = t.kind.synth || {
+      filter: "moog",
+      cutoff_hz: 20000,
+      resonance: 0,
+      filter_env_amount: 0,
+      attack: 0.005,
+      decay: 0.1,
+      sustain: 0.7,
+      release: 0.2,
+    };
+
+    html += `<div class="synth-grid">`;
+    html += `<div class="synth-field"><label>Filter</label>
+      <select id="synth-filter" style="font-size:10px">
+        <option value="moog" ${synth.filter === "moog" ? "selected" : ""}>Moog 24dB</option>
+        <option value="lowpass" ${synth.filter === "lowpass" ? "selected" : ""}>SVF LPF 12dB</option>
+        <option value="highpass" ${synth.filter === "highpass" ? "selected" : ""}>Highpass</option>
+        <option value="bandpass" ${synth.filter === "bandpass" ? "selected" : ""}>Bandpass</option>
+        <option value="none" ${synth.filter === "none" ? "selected" : ""}>Off</option>
+      </select></div>`;
+
+    html += `<div class="synth-field"><label>Cutoff <span id="lbl-cutoff">${Math.round(synth.cutoff_hz)}Hz</span></label>
+      <input type="range" id="synth-cutoff" min="20" max="20000" step="20" value="${synth.cutoff_hz}"></div>`;
+
+    html += `<div class="synth-field"><label>Resonance <span id="lbl-reso">${(synth.resonance * 100).toFixed(0)}%</span></label>
+      <input type="range" id="synth-reso" min="0" max="0.95" step="0.01" value="${synth.resonance}"></div>`;
+
+    html += `<div class="synth-field"><label>Env Mod <span id="lbl-env-amt">${(synth.filter_env_amount * 100).toFixed(0)}%</span></label>
+      <input type="range" id="synth-env-amt" min="-1" max="1" step="0.05" value="${synth.filter_env_amount}"></div>`;
+
+    html += `<div class="synth-field"><label>Attack <span id="lbl-att">${(synth.attack * 1000).toFixed(0)}ms</span></label>
+      <input type="range" id="synth-att" min="0.001" max="1.0" step="0.005" value="${synth.attack}"></div>`;
+
+    html += `<div class="synth-field"><label>Decay <span id="lbl-dec">${(synth.decay * 1000).toFixed(0)}ms</span></label>
+      <input type="range" id="synth-dec" min="0.01" max="2.0" step="0.01" value="${synth.decay}"></div>`;
+
+    html += `<div class="synth-field"><label>Sustain <span id="lbl-sus">${(synth.sustain * 100).toFixed(0)}%</span></label>
+      <input type="range" id="synth-sus" min="0" max="1.0" step="0.01" value="${synth.sustain}"></div>`;
+
+    html += `<div class="synth-field"><label>Release <span id="lbl-rel">${(synth.release * 1000).toFixed(0)}ms</span></label>
+      <input type="range" id="synth-rel" min="0.01" max="2.5" step="0.01" value="${synth.release}"></div>`;
+
+    html += `</div>`;
   } else {
     // Preset selection for SoundFont
     let presets = [];
@@ -305,6 +349,65 @@ function renderInstrumentPanel() {
     wfSel.onchange = (e) => {
       apply({ cmd: "set_track_waveform", track: t.id, waveform: e.target.value });
       refresh();
+    };
+  }
+
+  const updateSynth = (key, val) => {
+    const cur = t.kind.synth || {
+      filter: "moog",
+      cutoff_hz: 20000,
+      resonance: 0,
+      filter_env_amount: 0,
+      attack: 0.005,
+      decay: 0.1,
+      sustain: 0.7,
+      release: 0.2,
+    };
+    const s = { ...cur, [key]: val };
+    apply({ cmd: "set_track_synth", track: t.id, synth: s });
+  };
+
+  if ($("synth-filter")) $("synth-filter").onchange = (e) => updateSynth("filter", e.target.value);
+  if ($("synth-cutoff")) {
+    $("synth-cutoff").oninput = (e) => {
+      if ($("lbl-cutoff")) $("lbl-cutoff").textContent = Math.round(+e.target.value) + "Hz";
+      updateSynth("cutoff_hz", +e.target.value);
+    };
+  }
+  if ($("synth-reso")) {
+    $("synth-reso").oninput = (e) => {
+      if ($("lbl-reso")) $("lbl-reso").textContent = (+e.target.value * 100).toFixed(0) + "%";
+      updateSynth("resonance", +e.target.value);
+    };
+  }
+  if ($("synth-env-amt")) {
+    $("synth-env-amt").oninput = (e) => {
+      if ($("lbl-env-amt")) $("lbl-env-amt").textContent = (+e.target.value * 100).toFixed(0) + "%";
+      updateSynth("filter_env_amount", +e.target.value);
+    };
+  }
+  if ($("synth-att")) {
+    $("synth-att").oninput = (e) => {
+      if ($("lbl-att")) $("lbl-att").textContent = (+e.target.value * 1000).toFixed(0) + "ms";
+      updateSynth("attack", +e.target.value);
+    };
+  }
+  if ($("synth-dec")) {
+    $("synth-dec").oninput = (e) => {
+      if ($("lbl-dec")) $("lbl-dec").textContent = (+e.target.value * 1000).toFixed(0) + "ms";
+      updateSynth("decay", +e.target.value);
+    };
+  }
+  if ($("synth-sus")) {
+    $("synth-sus").oninput = (e) => {
+      if ($("lbl-sus")) $("lbl-sus").textContent = (+e.target.value * 100).toFixed(0) + "%";
+      updateSynth("sustain", +e.target.value);
+    };
+  }
+  if ($("synth-rel")) {
+    $("synth-rel").oninput = (e) => {
+      if ($("lbl-rel")) $("lbl-rel").textContent = (+e.target.value * 1000).toFixed(0) + "ms";
+      updateSynth("release", +e.target.value);
     };
   }
 
@@ -1237,10 +1340,94 @@ addEventListener("drop", async (e) => {
   else importAudioFile(f);
 });
 
+// ───────────────────────── mix diagnostics ─────────────────────────
+function runDiagnostics() {
+  if (!eng) return;
+  try {
+    const res = JSON.parse(eng.diagnose_json());
+    renderDiagnostics(res);
+    log("Mix Diagnostics: " + res.summary);
+  } catch (e) {
+    log("Diagnostics error: " + e);
+  }
+}
+
+function renderDiagnostics(res) {
+  if (!res || !res.lufs) return;
+  const lufs = res.lufs;
+  const lufsEl = $("lufs-val");
+  const tagEl = $("lufs-tag");
+  const tpEl = $("tp-val");
+  const lraEl = $("lra-val");
+  const clashListEl = $("clash-list");
+
+  if (lufsEl) lufsEl.textContent = `${lufs.integrated.toFixed(1)} LUFS`;
+  if (tpEl) tpEl.textContent = `${lufs.true_peak_db.toFixed(1)} dBTP`;
+  if (lraEl) lraEl.textContent = `${lufs.loudness_range.toFixed(1)} LU`;
+
+  if (tagEl) {
+    if (lufs.integrated >= -16 && lufs.integrated <= -12) {
+      tagEl.textContent = "Optimal (Streaming)";
+      tagEl.style.background = "#1b3a2a";
+      tagEl.style.color = "#6fcf97";
+    } else if (lufs.integrated > -12) {
+      tagEl.textContent = "Loud (May Attenuate)";
+      tagEl.style.background = "#3a2a1b";
+      tagEl.style.color = "#f2c94c";
+    } else {
+      tagEl.textContent = "Quiet / Dynamic";
+      tagEl.style.background = "#252532";
+      tagEl.style.color = "#aaa";
+    }
+  }
+
+  if (clashListEl) {
+    if (!res.clashes || res.clashes.length === 0) {
+      clashListEl.innerHTML = `<div style="font-size:10px;color:#6fcf97;padding:4px 0">✓ Clean mix: No frequency masking clashes detected.</div>`;
+    } else {
+      let html = `<div style="font-size:10px;color:#eb5757;margin-bottom:4px">⚠ ${res.clashes.length} Frequency Clash(es) Found:</div>`;
+      for (const c of res.clashes) {
+        const sevClass = c.severity === "high" ? "" : (c.severity === "medium" ? "med" : "low");
+        html += `<div class="clash-card ${sevClass}">
+          <div class="clash-header">
+            <span>[${c.severity.toUpperCase()}] ${esc(c.track_a_name)} vs ${esc(c.track_b_name)}</span>
+            <span>${c.band.toUpperCase()}</span>
+          </div>
+          <div class="clash-desc">${esc(c.suggestion)}</div>
+        </div>`;
+      }
+      clashListEl.innerHTML = html;
+    }
+  }
+}
+
+const btnDiag = $("btn-diagnose");
+if (btnDiag) {
+  btnDiag.onclick = runDiagnostics;
+}
+
 // ───────────────────────── demo project ─────────────────────────
-apply({ cmd: "add_track", name: "Grand Piano", kind: { type: "instrument", waveform: "pluck" } });
+apply({
+  cmd: "add_track",
+  name: "Moog Synth",
+  kind: {
+    type: "instrument",
+    waveform: "saw",
+    synth: {
+      filter: "moog",
+      cutoff_hz: 1200,
+      resonance: 0.55,
+      filter_env_amount: 0.5,
+      attack: 0.005,
+      decay: 0.25,
+      sustain: 0.4,
+      release: 0.25,
+    },
+  },
+});
 apply({ cmd: "add_track", name: "Lead Vocal", kind: { type: "vocal", voice: "default" } });
 apply({ cmd: "add_notes", track: 1, notes: [48, 52, 55, 60, 55, 52, 55, 64].map((p, i) => ({ start: i * 480, duration: 480, pitch: p, velocity: 90 })) });
 apply({ cmd: "add_notes", track: 2, notes: [[64, "안"], [67, "녕"], [69, "키"], [72, "미"], [71, "온"]].map(([p, l], i) => ({ start: i * 720, duration: 720, pitch: p, velocity: 100, lyric: l })) });
 apply({ cmd: "add_fx", track: 1, kind: { type: "reverb", room_size: 0.65, damping: 0.3, width: 1.0, mix: 0.25 } });
 apply({ cmd: "add_fx", track: 2, kind: { type: "delay", time_ms: 220, feedback: 0.4, mix: 0.25, ping_pong: true } });
+setTimeout(runDiagnostics, 100);

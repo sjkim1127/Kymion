@@ -56,6 +56,68 @@ pub struct SoundfontConfig {
     pub preset: u16,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SynthFilter {
+    #[default]
+    Moog,
+    Lowpass,
+    Highpass,
+    Bandpass,
+    None,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct SynthConfig {
+    #[serde(default)]
+    pub filter: SynthFilter,
+    #[serde(default = "default_cutoff")]
+    pub cutoff_hz: f32,
+    #[serde(default)]
+    pub resonance: f32,
+    #[serde(default)]
+    pub filter_env_amount: f32,
+    #[serde(default = "default_attack")]
+    pub attack: f32,
+    #[serde(default = "default_decay")]
+    pub decay: f32,
+    #[serde(default = "default_sustain")]
+    pub sustain: f32,
+    #[serde(default = "default_release")]
+    pub release: f32,
+}
+
+fn default_cutoff() -> f32 {
+    20000.0
+}
+fn default_attack() -> f32 {
+    0.005
+}
+fn default_decay() -> f32 {
+    0.1
+}
+fn default_sustain() -> f32 {
+    0.7
+}
+fn default_release() -> f32 {
+    0.2
+}
+
+impl Default for SynthConfig {
+    fn default() -> Self {
+        Self {
+            filter: SynthFilter::Moog,
+            cutoff_hz: 20000.0,
+            resonance: 0.0,
+            filter_env_amount: 0.0,
+            attack: 0.005,
+            decay: 0.1,
+            sustain: 0.7,
+            release: 0.2,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TrackKind {
@@ -64,6 +126,8 @@ pub enum TrackKind {
         waveform: Waveform,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         soundfont: Option<SoundfontConfig>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        synth: Option<SynthConfig>,
     },
     /// Singing-voice track (vocaloid-style). Notes carry lyrics.
     Vocal { voice: String },
@@ -76,6 +140,7 @@ impl TrackKind {
         Self::Instrument {
             waveform,
             soundfont: None,
+            synth: None,
         }
     }
 
@@ -87,6 +152,15 @@ impl TrackKind {
                 bank,
                 preset,
             }),
+            synth: None,
+        }
+    }
+
+    pub fn synth(waveform: Waveform, synth: SynthConfig) -> Self {
+        Self::Instrument {
+            waveform,
+            soundfont: None,
+            synth: Some(synth),
         }
     }
 }
@@ -366,6 +440,100 @@ impl Track {
             pan_auto: vec![],
         }
     }
+}
+
+/// Standard audio frequency bands for spectral & masking analysis.
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FrequencyBand {
+    SubBass,
+    Bass,
+    LowMid,
+    Mid,
+    HighMid,
+    High,
+}
+
+impl FrequencyBand {
+    pub const ALL: [FrequencyBand; 6] = [
+        FrequencyBand::SubBass,
+        FrequencyBand::Bass,
+        FrequencyBand::LowMid,
+        FrequencyBand::Mid,
+        FrequencyBand::HighMid,
+        FrequencyBand::High,
+    ];
+
+    pub fn freq_range_hz(&self) -> (f32, f32) {
+        match self {
+            FrequencyBand::SubBass => (20.0, 60.0),
+            FrequencyBand::Bass => (60.0, 250.0),
+            FrequencyBand::LowMid => (250.0, 500.0),
+            FrequencyBand::Mid => (500.0, 2000.0),
+            FrequencyBand::HighMid => (2000.0, 6000.0),
+            FrequencyBand::High => (6000.0, 20000.0),
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            FrequencyBand::SubBass => "Sub-Bass (20-60 Hz)",
+            FrequencyBand::Bass => "Bass (60-250 Hz)",
+            FrequencyBand::LowMid => "Low-Mid (250-500 Hz)",
+            FrequencyBand::Mid => "Mid (500-2000 Hz)",
+            FrequencyBand::HighMid => "High-Mid (2-6 kHz)",
+            FrequencyBand::High => "High / Air (6-20 kHz)",
+        }
+    }
+}
+
+/// Severity classification of frequency masking between tracks.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClashSeverity {
+    Low,
+    Medium,
+    High,
+}
+
+/// Detail of a frequency masking clash between two tracks.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct FrequencyClash {
+    pub track_a_id: u32,
+    pub track_a_name: String,
+    pub track_b_id: u32,
+    pub track_b_name: String,
+    pub band: FrequencyBand,
+    pub freq_range_hz: (f32, f32),
+    pub severity: ClashSeverity,
+    pub overlap_score: f32,
+    pub clash_duration_sec: f32,
+    pub suggestion: String,
+}
+
+/// ITU-R BS.1770-4 standard loudness and true peak metrics.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct LufsReport {
+    /// Integrated loudness across entire audio (ITU-R BS.1770-4 gated LKFS/LUFS)
+    pub integrated: f32,
+    /// Maximum momentary loudness (400ms window)
+    pub momentary_max: f32,
+    /// Maximum short-term loudness (3-second window)
+    pub short_term_max: f32,
+    /// Loudness Range in LU (statistical dynamic range)
+    pub loudness_range: f32,
+    /// True Peak level in dBTP
+    pub true_peak_db: f32,
+}
+
+/// Overall mixing and acoustics diagnostic report for AI agents and producers.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct DiagnosticReport {
+    pub lufs: LufsReport,
+    pub clashes: Vec<FrequencyClash>,
+    pub summary: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -696,6 +864,11 @@ pub enum Command {
     SetTrackWaveform {
         track: u32,
         waveform: Waveform,
+    },
+    /// Configure subtractive synthesizer engine (filter, resonance, ADSR) on an instrument track.
+    SetTrackSynth {
+        track: u32,
+        synth: Option<SynthConfig>,
     },
 }
 fn vel() -> u8 {
@@ -1295,6 +1468,13 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
                 _ => return Err(Error::Invalid("track is not an instrument track".into())),
             }
         }
+        Command::SetTrackSynth { track, synth } => {
+            let t = p.track_mut(track)?;
+            match &mut t.kind {
+                TrackKind::Instrument { synth: s_slot, .. } => *s_slot = synth,
+                _ => return Err(Error::Invalid("track is not an instrument track".into())),
+            }
+        }
     }
     Ok(out)
 }
@@ -1649,5 +1829,30 @@ mod tests {
                 }),
             })
             .is_err());
+
+        // Test SetTrackSynth
+        e.apply(Command::SetTrackSynth {
+            track: t,
+            synth: Some(SynthConfig {
+                filter: SynthFilter::Moog,
+                cutoff_hz: 1200.0,
+                resonance: 0.65,
+                filter_env_amount: 0.5,
+                attack: 0.01,
+                decay: 0.2,
+                sustain: 0.4,
+                release: 0.3,
+            }),
+        })
+        .unwrap();
+
+        match &e.project.tracks[0].kind {
+            TrackKind::Instrument { synth: Some(s), .. } => {
+                assert_eq!(s.filter, SynthFilter::Moog);
+                assert_eq!(s.cutoff_hz, 1200.0);
+                assert_eq!(s.resonance, 0.65);
+            }
+            _ => panic!("Expected synth config"),
+        }
     }
 }

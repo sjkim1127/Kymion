@@ -21,7 +21,8 @@ Kymion is edited **only through JSON commands**. Never hand-edit project files.
 
 ## DAW Operations
 - Tracks: `instrument`, `vocal`, `audio`. `set_mix` has `gain/pan/mute/solo`; `rename_track`.
-- Virtual Instruments & SoundFonts: `set_track_soundfont {track, soundfont: {asset, bank?, preset?}}` (set `soundfont: null` to return to synth oscillator), `set_track_waveform {track, waveform: pluck|saw|square|sine|triangle}`.
+- Virtual Instruments & Subtractive Synthesizer: `set_track_synth {track, synth: {filter: moog|lowpass|highpass|bandpass|none, cutoff_hz, resonance, filter_env_amount, attack, decay, sustain, release}}`, `set_track_waveform {track, waveform: pluck|saw|square|sine|triangle}`, `set_track_soundfont {track, soundfont: {asset, bank?, preset?}}` (set `soundfont: null` to return to synth oscillator).
+- AI Diagnostics: `kymion diagnose song.kymion.json` performs ITU-R BS.1770-4 gated loudness measurement (LUFS, True Peak, LRA) and 6-band frequency masking clash detection with mixing suggestions. `kymion analyze` returns peak, RMS, clipping, duration, and LUFS.
 - Transport/grid: `set_time_signature {numerator, denominator}`, `set_loop {start,end}` (omit both to clear).
 - Batch note edits (one undo step): `add_notes`, `remove_notes`, `move_notes {delta_tick, delta_pitch}`, `set_velocity`, `split_note`, `quantize`, `transpose`.
 - Audio: `kymion import-audio song.kymion.json clip.wav [--track ID] [--start TICK]` embeds the WAV (mono) and places a clip; then `add_clip`, `move_clip`, `remove_clip`, `trim_clip {track, clip, start?, offset_ticks?, duration_ticks?}`, `split_clip {track, clip, at}`, `set_clip_gain {track, clip, gain}`, `set_clip_fade {track, clip, fade_in_ticks?, fade_out_ticks?}`.
