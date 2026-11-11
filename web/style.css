@@ -2,7 +2,7 @@
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:13px system-ui,sans-serif;height:100vh;display:flex;flex-direction:column}
 header{display:flex;gap:8px;align-items:center;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
-.logo{height:36px;background:#fff;border-radius:50%}
+.logo{height:38px;background:transparent;}
 h1{margin:0 0 0 6px;font:600 18px Optima,Cinzel,serif;letter-spacing:.35em;color:var(--gold)}
 .spacer{flex:1}
 button{background:#222228;color:var(--fg);border:1px solid #3a3a42;border-radius:6px;padding:5px 10px;cursor:pointer}
