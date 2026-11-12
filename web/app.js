@@ -148,10 +148,9 @@ function renderTracks() {
       const d = box.children[i];
       if (!d) return;
       d.className = "trk" + (t.id === sel ? " sel" : "");
-      const icon = t.kind.type === "vocal" ? "🎤" : t.kind.type === "audio" ? "🔊" : (t.kind.soundfont ? "🎻" : "🎹");
       const sfTag = t.kind.soundfont ? " [SF2]" : "";
       const nameEl = d.querySelector(".tname");
-      if (nameEl) nameEl.textContent = `${icon} ${t.name}${sfTag}${t.fx.length ? ` [${t.fx.length} FX]` : ""}`;
+      if (nameEl) nameEl.textContent = `${t.name}${sfTag}${t.fx.length ? ` [${t.fx.length} FX]` : ""}`;
 
       const muteBtn = d.querySelector('[data-a="mute"]');
       if (muteBtn) muteBtn.className = "ms " + (t.mute ? "on-mute" : "");
@@ -173,14 +172,13 @@ function renderTracks() {
   renderedTrackKey = trackKey;
   box.innerHTML = "";
   for (const t of P.tracks) {
-    const icon = t.kind.type === "vocal" ? "🎤" : t.kind.type === "audio" ? "🔊" : (t.kind.soundfont ? "🎻" : "🎹");
     const sfTag = t.kind.soundfont ? " [SF2]" : "";
     const d = document.createElement("div");
     d.className = "trk" + (t.id === sel ? " sel" : "");
     d.dataset.tid = t.id;
     d.innerHTML = `
       <div style="display:flex;align-items:center;width:100%;gap:4px">
-        <span class="tname" title="Double-click to rename">${icon} ${t.name}${sfTag}${t.fx.length ? ` [${t.fx.length} FX]` : ""}</span>
+        <span class="tname" title="Double-click to rename">${t.name}${sfTag}${t.fx.length ? ` [${t.fx.length} FX]` : ""}</span>
         <span class="spacer" style="flex:1"></span>
         <button class="ms ${t.mute ? "on-mute" : ""}" data-a="mute" title="Mute">M</button>
         <button class="ms ${t.solo ? "on-solo" : ""}" data-a="solo" title="Solo">S</button>
@@ -882,7 +880,7 @@ async function play(from = playhead) {
     });
     feedWorklet();
     playing = true;
-    $("play").textContent = "⏸";
+    $("play").textContent = "Pause";
     requestAnimationFrame(frame);
   } else {
     ctx ??= new AudioContext({ sampleRate: eng.sample_rate() });
@@ -895,9 +893,9 @@ async function play(from = playhead) {
     s.buffer = buf; s.connect(ctx.destination);
     if (lr) { s.loop = true; s.loopStart = lr.start * spt(); s.loopEnd = lr.end * spt(); }
     s.start(0, Math.max(0, from * spt()));
-    s.onended = () => { if (srcNode === s) { srcNode = null; playing = false; playhead = Math.min(playhead, from); $("play").textContent = "▶"; clearMeters(); draw(); } };
+    s.onended = () => { if (srcNode === s) { srcNode = null; playing = false; playhead = Math.min(playhead, from); $("play").textContent = "Play"; clearMeters(); draw(); } };
     srcNode = s; t0 = ctx.currentTime; startTick = from; playing = true;
-    $("play").textContent = "⏸";
+    $("play").textContent = "Pause";
     requestAnimationFrame(frame);
   }
 }
@@ -920,7 +918,7 @@ function pause() {
   }
   stopSrc();
   playing = false;
-  $("play").textContent = "▶";
+  $("play").textContent = "Play";
   clearMeters();
   draw();
 }
@@ -932,7 +930,7 @@ function stopAll() {
   }
   stopSrc();
   playing = false;
-  $("play").textContent = "▶";
+  $("play").textContent = "Play";
   playhead = P.loop_region ? P.loop_region.start : 0;
   scrollX = Math.max(0, Math.min(scrollX, playhead));
   clearMeters();
@@ -1516,9 +1514,9 @@ function renderDiagnostics(res) {
 
   if (clashListEl) {
     if (!res.clashes || res.clashes.length === 0) {
-      clashListEl.innerHTML = `<div style="font-size:10px;color:#6fcf97;padding:4px 0">✓ Clean mix: No frequency masking clashes detected.</div>`;
+      clashListEl.innerHTML = `<div style="font-size:10px;color:#6fcf97;padding:4px 0">Clean mix: No frequency masking clashes detected.</div>`;
     } else {
-      let html = `<div style="font-size:10px;color:#eb5757;margin-bottom:4px">⚠ ${res.clashes.length} Frequency Clash(es) Found:</div>`;
+      let html = `<div style="font-size:10px;color:#eb5757;margin-bottom:4px">${res.clashes.length} Frequency Clash(es) Found:</div>`;
       for (const c of res.clashes) {
         const sevClass = c.severity === "high" ? "" : (c.severity === "medium" ? "med" : "low");
         html += `<div class="clash-card ${sevClass}">
