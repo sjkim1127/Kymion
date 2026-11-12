@@ -51,6 +51,91 @@ pub struct Analysis {
     pub lufs: Option<LufsReport>,
 }
 
+pub fn render_single_note_synth(
+    wf: Waveform,
+    synth: Option<&SynthConfig>,
+    pitch: u8,
+    velocity: u8,
+    dur: f32,
+    sr: u32,
+    buf: &mut [f32],
+) {
+    let srf = sr as f32;
+    let hz = midi_to_hz(pitch as f32);
+    let vel = velocity as f32 / 127.0;
+
+    if let Some(cfg) = synth {
+        let mut osc = Osc::default();
+        let mut amp_env = AnalogAdsr::new(cfg.attack, cfg.decay, cfg.sustain, cfg.release, srf);
+        let mut flt_env = AnalogAdsr::new(cfg.attack, cfg.decay, cfg.sustain, cfg.release, srf);
+        let mut moog = MoogLadder::new();
+        let mut svf = StateVariableFilter::new();
+
+        for (i, sample) in buf.iter_mut().enumerate() {
+            if i as f32 / srf >= dur {
+                amp_env.gate_off();
+                flt_env.gate_off();
+            }
+            let raw = match wf {
+                Waveform::Sine => osc.sine(hz, srf),
+                Waveform::Saw => osc.saw(hz, srf) * 0.5,
+                Waveform::Square => osc.square(hz, srf) * 0.4,
+                Waveform::Triangle => osc.triangle(hz, srf),
+                Waveform::Pluck => osc.saw(hz, srf) * 0.5,
+            };
+
+            let a = amp_env.next();
+            let f_mod = flt_env.next();
+
+            let cutoff = if cfg.filter_env_amount != 0.0 {
+                let oct = cfg.filter_env_amount * 4.0;
+                (cfg.cutoff_hz * 2f32.powf(f_mod * oct)).clamp(20.0, srf * 0.48)
+            } else {
+                cfg.cutoff_hz.clamp(20.0, srf * 0.48)
+            };
+
+            let filtered = match cfg.filter {
+                SynthFilter::Moog => moog.process(raw, cutoff, cfg.resonance, srf),
+                SynthFilter::Lowpass => {
+                    svf.process(raw, cutoff, cfg.resonance, SvfMode::Lowpass, srf)
+                }
+                SynthFilter::Highpass => {
+                    svf.process(raw, cutoff, cfg.resonance, SvfMode::Highpass, srf)
+                }
+                SynthFilter::Bandpass => {
+                    svf.process(raw, cutoff, cfg.resonance, SvfMode::Bandpass, srf)
+                }
+                SynthFilter::None => raw,
+            };
+
+            *sample += filtered * a * vel * 0.5;
+
+            if !amp_env.is_active() && (i as f32 / srf) >= dur {
+                break;
+            }
+        }
+    } else {
+        let mut osc = Osc::default();
+        let mut env = match wf {
+            Waveform::Pluck => Adsr::new(0.002, 0.4, 0.0, 0.15, srf),
+            _ => Adsr::new(0.01, 0.1, 0.7, 0.25, srf),
+        };
+        for (i, sample) in buf.iter_mut().enumerate() {
+            if i as f32 / srf >= dur {
+                env.gate_off();
+            }
+            let s = match wf {
+                Waveform::Sine => osc.sine(hz, srf),
+                Waveform::Saw => osc.saw(hz, srf) * 0.5,
+                Waveform::Square => osc.square(hz, srf) * 0.4,
+                Waveform::Triangle => osc.triangle(hz, srf),
+                Waveform::Pluck => osc.saw(hz, srf) * 0.5,
+            };
+            *sample += s * env.next() * vel * 0.5;
+        }
+    }
+}
+
 fn render_instrument_into(
     p: &Project,
     t: &Track,
@@ -62,87 +147,20 @@ fn render_instrument_into(
     let srf = sr as f32;
     for n in &t.notes {
         let dur = p.ticks_to_secs(n.duration);
-        let hz = midi_to_hz(n.pitch as f32);
-        let vel = n.velocity as f32 / 127.0;
         let off = (p.ticks_to_secs(n.start) * srf) as usize;
-
-        if let Some(cfg) = synth {
-            let release_pad = cfg.release.max(0.1);
-            let len = ((dur + release_pad + 0.1) * srf) as usize;
-            let note_end = (off + len).min(buf.len());
-            let count = note_end.saturating_sub(off);
-
-            let mut osc = Osc::default();
-            let mut amp_env = AnalogAdsr::new(cfg.attack, cfg.decay, cfg.sustain, cfg.release, srf);
-            let mut flt_env = AnalogAdsr::new(cfg.attack, cfg.decay, cfg.sustain, cfg.release, srf);
-            let mut moog = MoogLadder::new();
-            let mut svf = StateVariableFilter::new();
-
-            for i in 0..count {
-                if i as f32 / srf >= dur {
-                    amp_env.gate_off();
-                    flt_env.gate_off();
-                }
-                let raw = match wf {
-                    Waveform::Sine => osc.sine(hz, srf),
-                    Waveform::Saw => osc.saw(hz, srf) * 0.5,
-                    Waveform::Square => osc.square(hz, srf) * 0.4,
-                    Waveform::Triangle => osc.triangle(hz, srf),
-                    Waveform::Pluck => osc.saw(hz, srf) * 0.5,
-                };
-
-                let a = amp_env.next();
-                let f_mod = flt_env.next();
-
-                let cutoff = if cfg.filter_env_amount != 0.0 {
-                    let oct = cfg.filter_env_amount * 4.0;
-                    (cfg.cutoff_hz * 2f32.powf(f_mod * oct)).clamp(20.0, srf * 0.48)
-                } else {
-                    cfg.cutoff_hz.clamp(20.0, srf * 0.48)
-                };
-
-                let filtered = match cfg.filter {
-                    SynthFilter::Moog => moog.process(raw, cutoff, cfg.resonance, srf),
-                    SynthFilter::Lowpass => {
-                        svf.process(raw, cutoff, cfg.resonance, SvfMode::Lowpass, srf)
-                    }
-                    SynthFilter::Highpass => {
-                        svf.process(raw, cutoff, cfg.resonance, SvfMode::Highpass, srf)
-                    }
-                    SynthFilter::Bandpass => {
-                        svf.process(raw, cutoff, cfg.resonance, SvfMode::Bandpass, srf)
-                    }
-                    SynthFilter::None => raw,
-                };
-
-                buf[off + i] += filtered * a * vel * 0.5;
-
-                if !amp_env.is_active() && (i as f32 / srf) >= dur {
-                    break;
-                }
-            }
-        } else {
-            let len = ((dur + 0.35) * srf) as usize;
-            let mut osc = Osc::default();
-            let mut env = match wf {
-                Waveform::Pluck => Adsr::new(0.002, 0.4, 0.0, 0.15, srf),
-                _ => Adsr::new(0.01, 0.1, 0.7, 0.25, srf),
-            };
-            let note_end = (off + len).min(buf.len());
-            let count = note_end.saturating_sub(off);
-            for i in 0..count {
-                if i as f32 / srf >= dur {
-                    env.gate_off();
-                }
-                let s = match wf {
-                    Waveform::Sine => osc.sine(hz, srf),
-                    Waveform::Saw => osc.saw(hz, srf) * 0.5,
-                    Waveform::Square => osc.square(hz, srf) * 0.4,
-                    Waveform::Triangle => osc.triangle(hz, srf),
-                    Waveform::Pluck => osc.saw(hz, srf) * 0.5,
-                };
-                buf[off + i] += s * env.next() * vel * 0.5;
-            }
+        let release_pad = synth.map(|s| s.release.max(0.1)).unwrap_or(0.35);
+        let len = ((dur + release_pad + 0.1) * srf) as usize;
+        let note_end = (off + len).min(buf.len());
+        if off < buf.len() {
+            render_single_note_synth(
+                wf,
+                synth,
+                n.pitch,
+                n.velocity,
+                dur,
+                sr,
+                &mut buf[off..note_end],
+            );
         }
     }
 }
@@ -242,6 +260,147 @@ fn render_soundfont_into(
             }
             evt_idx += 1;
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_single_note_soundfont(
+    p: &Project,
+    sf_cfg: &SoundfontConfig,
+    pitch: u8,
+    velocity: u8,
+    dur: f32,
+    sr: u32,
+    out_l: &mut [f32],
+    out_r: &mut [f32],
+) {
+    let Some(sf_asset) = p.soundfonts.iter().find(|sf| sf.id == sf_cfg.asset) else {
+        return;
+    };
+    let sf_bytes = sf_asset.bytes();
+    if sf_bytes.is_empty() {
+        return;
+    }
+    let mut cursor = std::io::Cursor::new(sf_bytes);
+    let Ok(soundfont) = rustysynth::SoundFont::new(&mut cursor) else {
+        return;
+    };
+    let soundfont = std::sync::Arc::new(soundfont);
+    let settings = rustysynth::SynthesizerSettings::new(sr as i32);
+    let Ok(mut synth) = rustysynth::Synthesizer::new(&soundfont, &settings) else {
+        return;
+    };
+
+    let bank = sf_cfg.bank as i32;
+    synth.process_midi_message(0, 0xB0, 0x00, bank >> 7);
+    synth.process_midi_message(0, 0xB0, 0x20, bank & 0x7F);
+    synth.process_midi_message(0, 0xC0, sf_cfg.preset as i32, 0);
+
+    let srf = sr as f32;
+    let off_samples = (dur * srf) as usize;
+    let total_samples = out_l.len().min(out_r.len());
+
+    synth.note_on(0, pitch as i32, velocity as i32);
+
+    let mut cur = 0;
+    while cur < total_samples {
+        let next = if cur < off_samples {
+            off_samples.min(total_samples)
+        } else {
+            total_samples
+        };
+
+        if next > cur {
+            synth.render(&mut out_l[cur..next], &mut out_r[cur..next]);
+            cur = next;
+        }
+
+        if cur == off_samples {
+            synth.note_off(0, pitch as i32);
+            synth.render(
+                &mut out_l[cur..total_samples],
+                &mut out_r[cur..total_samples],
+            );
+            break;
+        }
+    }
+}
+
+/// Render a single note audition preview for an interactive track.
+pub fn render_note_preview(
+    p: &Project,
+    track_id: u32,
+    pitch: u8,
+    duration_secs: f32,
+    velocity: u8,
+) -> Stereo {
+    let sr = p.sample_rate;
+    let srf = sr as f32;
+    let dur = duration_secs.clamp(0.05, 2.0);
+    let total_samples = ((dur + 0.35) * srf) as usize;
+
+    let mut left = vec![0.0f32; total_samples];
+    let mut right = vec![0.0f32; total_samples];
+
+    let Some(t) = p.tracks.iter().find(|t| t.id == track_id) else {
+        return Stereo {
+            sample_rate: sr,
+            left,
+            right,
+        };
+    };
+
+    match &t.kind {
+        TrackKind::Instrument {
+            waveform,
+            soundfont,
+            synth,
+        } => {
+            if let Some(sf_cfg) = soundfont {
+                render_single_note_soundfont(
+                    p, sf_cfg, pitch, velocity, dur, sr, &mut left, &mut right,
+                );
+            } else {
+                let mut mono = vec![0.0f32; total_samples];
+                render_single_note_synth(
+                    *waveform,
+                    synth.as_ref(),
+                    pitch,
+                    velocity,
+                    dur,
+                    sr,
+                    &mut mono,
+                );
+                left.copy_from_slice(&mono);
+                right.copy_from_slice(&mono);
+            }
+        }
+        TrackKind::Vocal { .. } => {
+            let mut dummy_track = t.clone();
+            dummy_track.notes = vec![kymion_core::Note {
+                id: 1,
+                start: 0,
+                duration: p.secs_to_ticks(dur),
+                pitch,
+                velocity,
+                lyric: Some("아".to_string()),
+                expression: None,
+            }];
+            let v = render_vocal(p, &dummy_track, &FormantVoice, sr);
+            let len = v.len().min(total_samples);
+            left[..len].copy_from_slice(&v[..len]);
+            right[..len].copy_from_slice(&v[..len]);
+        }
+        TrackKind::Audio => {}
+    }
+
+    // Apply track's insert FX chain
+    apply_fx_chain(&mut left, &mut right, &t.fx, sr);
+
+    Stereo {
+        sample_rate: sr,
+        left,
+        right,
     }
 }
 
@@ -1349,5 +1508,37 @@ mod tests {
         assert_eq!(diag.clashes[0].track_a_id, t1);
         assert_eq!(diag.clashes[0].track_b_id, t2);
         assert!(diag.clashes[0].suggestion.contains("compete"));
+    }
+
+    #[test]
+    fn note_preview_audition() {
+        let mut e = Engine::default();
+        let t = e
+            .apply(Command::AddTrack {
+                name: "Synth".into(),
+                kind: TrackKind::synth(
+                    Waveform::Saw,
+                    SynthConfig {
+                        filter: SynthFilter::Moog,
+                        cutoff_hz: 1000.0,
+                        resonance: 0.5,
+                        filter_env_amount: 0.5,
+                        attack: 0.005,
+                        decay: 0.1,
+                        sustain: 0.5,
+                        release: 0.1,
+                    },
+                ),
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
+
+        let s = render_note_preview(&e.project, t, 60, 0.3, 100);
+        assert_eq!(s.sample_rate, 44100);
+        assert!(!s.left.is_empty());
+        assert_eq!(s.left.len(), s.right.len());
+        let peak = s.left.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        assert!(peak > 0.01, "Preview sound output was silent: {peak}");
     }
 }

@@ -17,6 +17,49 @@ let ctx = null, srcNode = null, t0 = 0, startTick = 0, cache = null, dirty = tru
 let workletNode = null, streamPos = 0, workletBuffered = 0, lastMeterUpdate = 0;
 let drag = null, clipboard = [];
 const peaksCache = new Map();
+let activePreviewKey = null;
+let activePreviewSource = null;
+
+const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const pitchName = (p) => `${NOTE_NAMES[p % 12]}${Math.floor(p / 12) - 1}`;
+const yToPitch = (y) => HIGH - Math.floor((y - RULER_H + scrollY) / KEY_H);
+
+async function playNotePreview(trackId, pitch, duration = 0.35, velocity = 100) {
+  if (trackId == null) return;
+  try {
+    ctx ??= new AudioContext({ sampleRate: eng.sample_rate() });
+    if (ctx.state === "suspended") await ctx.resume();
+
+    const data = eng.preview_note(trackId, pitch, duration, velocity);
+    if (!data || data.length === 0) return;
+
+    const numFrames = data.length / 2;
+    const sr = eng.sample_rate();
+    const buf = ctx.createBuffer(2, numFrames, sr);
+    const L = buf.getChannelData(0);
+    const R = buf.getChannelData(1);
+    for (let i = 0; i < numFrames; i++) {
+      L[i] = data[2 * i];
+      R[i] = data[2 * i + 1];
+    }
+
+    if (activePreviewSource) {
+      try { activePreviewSource.stop(); } catch {}
+      activePreviewSource = null;
+    }
+
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    src.start();
+    activePreviewSource = src;
+    src.onended = () => {
+      if (activePreviewSource === src) activePreviewSource = null;
+    };
+  } catch (err) {
+    console.warn("preview_note failed:", err);
+  }
+}
 
 const light = () => JSON.parse(eng.project_json_light());
 const track = () => P?.tracks.find((t) => t.id === sel);
@@ -56,6 +99,7 @@ window.kymion = {
   exportMidi: () => eng.export_midi(),
   play: () => play(), stop: () => stopAll(), get playhead() { return curTick(); },
   meters: () => JSON.parse(eng.meter_levels(streamPos, 2048)),
+  previewNote: (trackId, pitch, duration, velocity) => playNotePreview(trackId, pitch, duration, velocity),
 };
 
 // ───────────────────────── refresh / side panels ─────────────────────────
@@ -513,8 +557,22 @@ function drawRoll() {
   for (let n = LOW; n <= HIGH; n++) {
     const y = pitchY(n), black = [1, 3, 6, 8, 10].includes(n % 12);
     g.fillStyle = black ? "#121216" : "#17171d"; g.fillRect(gutter(), y, W, KEY_H);
-    g.fillStyle = black ? "#25252b" : "#d8d8dc"; g.fillRect(0, y, gutter(), KEY_H - 1);
-    if (n % 12 === 0) { g.fillStyle = "#444"; g.font = "9px sans-serif"; g.textBaseline = "alphabetic"; g.fillText("C" + (n / 12 - 1), 6, y + 10); }
+    const isPressed = n === activePreviewKey;
+    g.fillStyle = isPressed ? (black ? "#d4af37" : "#ffec99") : (black ? "#25252b" : "#d8d8dc");
+    g.fillRect(0, y, gutter(), KEY_H - 1);
+    if (isPressed) {
+      g.fillStyle = "rgba(212, 175, 55, 0.18)";
+      g.fillRect(gutter(), y, W - gutter(), KEY_H);
+      g.fillStyle = black ? "#000" : "#111";
+      g.font = "bold 9px sans-serif";
+      g.textBaseline = "alphabetic";
+      g.fillText(pitchName(n), 4, y + 10);
+    } else if (n % 12 === 0) {
+      g.fillStyle = "#444";
+      g.font = "9px sans-serif";
+      g.textBaseline = "alphabetic";
+      g.fillText("C" + (n / 12 - 1), 6, y + 10);
+    }
   }
   gridLines(RULER_H, bottom);
   for (const t of P.tracks) {
@@ -912,7 +970,19 @@ cv.addEventListener("pointerdown", (e) => {
 
 function rollDown(x, y, e) {
   const t = track();
-  if (!t || t.kind.type === "audio" || x < gutter()) return;
+  if (!t || t.kind.type === "audio") return;
+  if (x < gutter()) {
+    if (y >= RULER_H && y <= H - VEL_H) {
+      const pitch = yToPitch(y);
+      if (pitch >= LOW && pitch <= HIGH) {
+        activePreviewKey = pitch;
+        drag = { type: "piano_key", pitch };
+        playNotePreview(t.id, pitch, 0.4, 100);
+        draw();
+      }
+    }
+    return;
+  }
   if (y > H - VEL_H) {
     // velocity lane: pick nearest note stem
     const hit = t.notes.find((n) => Math.abs(tickToX(n.start) + 2 - x) <= 5);
@@ -928,14 +998,19 @@ function rollDown(x, y, e) {
     if (e.shiftKey && selNotes.has(hit.id)) { selNotes.delete(hit.id); draw(); return; }
     if (!selNotes.has(hit.id)) { if (!e.shiftKey) selNotes.clear(); selNotes.add(hit.id); }
     const edge = x > tickToX(hit.start + hit.duration) - 6;
-    drag = { type: edge ? "resize" : "move", x0: x, y0: y, dTick: 0, dPitch: 0, dDur: 0 };
+    drag = { type: edge ? "resize" : "move", x0: x, y0: y, dTick: 0, dPitch: 0, dDur: 0, lastAuditionPitch: hit.pitch };
+    playNotePreview(t.id, hit.pitch, 0.25, hit.velocity);
     draw();
     return;
   }
   if (tool === "draw") {
-    const start = snapFloor(xToTick(x)), pitch = HIGH - Math.floor((y - RULER_H + scrollY) / KEY_H);
+    const start = snapFloor(xToTick(x)), pitch = yToPitch(y);
     const out = apply({ cmd: "add_notes", track: t.id, notes: [{ start, duration: snap <= 1 ? 240 : snap, pitch, velocity: 100, lyric: t.kind.type === "vocal" ? "la" : null }] });
-    if (out.ok) { selNotes = new Set(out.note_ids); drag = { type: "resize", x0: x, y0: y, dTick: 0, dPitch: 0, dDur: 0 }; }
+    if (out.ok) {
+      selNotes = new Set(out.note_ids);
+      drag = { type: "resize", x0: x, y0: y, dTick: 0, dPitch: 0, dDur: 0 };
+      playNotePreview(t.id, pitch, 0.35, 100);
+    }
   } else {
     if (!e.shiftKey) selNotes.clear();
     drag = { type: "band", x0: x, y0: y, x1: x, y1: y, base: new Set(selNotes) };
@@ -988,6 +1063,16 @@ function arrangeDown(x, y, e) {
 cv.addEventListener("pointermove", (e) => {
   const [x, y] = local(e);
   if (!drag) {
+    if (view === "roll") {
+      if (x < gutter() && y >= RULER_H && y <= H - VEL_H) {
+        cv.style.cursor = "pointer";
+      } else if (y > H - VEL_H) {
+        cv.style.cursor = "ns-resize";
+      } else {
+        cv.style.cursor = tool === "draw" ? "crosshair" : "default";
+      }
+      return;
+    }
     if (view === "arrange") {
       const idx = Math.floor((y - RULER_H + scrollY) / LANE_H);
       const t = P?.tracks?.[idx];
@@ -1016,6 +1101,17 @@ cv.addEventListener("pointermove", (e) => {
   }
 
   switch (drag.type) {
+    case "piano_key": {
+      const pitch = yToPitch(y);
+      if (pitch >= LOW && pitch <= HIGH && pitch !== drag.pitch) {
+        drag.pitch = pitch;
+        activePreviewKey = pitch;
+        const t = track();
+        if (t) playNotePreview(t.id, pitch, 0.35, 100);
+        draw();
+      }
+      return;
+    }
     case "ruler": {
       if (Math.abs(x - drag.x0) > 4) {
         drag.moved = true;
@@ -1024,7 +1120,26 @@ cv.addEventListener("pointermove", (e) => {
       }
       break;
     }
-    case "move": drag.dTick = snapDelta((x - drag.x0) / ppt); drag.dPitch = -Math.round((y - drag.y0) / KEY_H); break;
+    case "move": {
+      drag.dTick = snapDelta((x - drag.x0) / ppt);
+      const newDP = -Math.round((y - drag.y0) / KEY_H);
+      if (newDP !== drag.dPitch) {
+        drag.dPitch = newDP;
+        const t = track();
+        if (t) {
+          const first = t.notes.find((n) => selNotes.has(n.id));
+          if (first) {
+            const p = Math.max(LOW, Math.min(HIGH, first.pitch + newDP));
+            if (p !== drag.lastAuditionPitch) {
+              drag.lastAuditionPitch = p;
+              activePreviewKey = p;
+              playNotePreview(t.id, p, 0.2, first.velocity);
+            }
+          }
+        }
+      }
+      break;
+    }
     case "resize": drag.dDur = snapDelta((x - drag.x0) / ppt); break;
     case "band": {
       drag.x1 = x; drag.y1 = y;
@@ -1045,8 +1160,13 @@ cv.addEventListener("pointermove", (e) => {
 });
 
 cv.addEventListener("pointerup", () => {
+  if (activePreviewKey !== null) {
+    activePreviewKey = null;
+    draw();
+  }
   if (!drag) return;
   const d = drag; drag = null;
+  if (d.type === "piano_key") return;
   const t = track();
   switch (d.type) {
     case "ruler":
@@ -1203,6 +1323,19 @@ addEventListener("keydown", (e) => {
     const dt = key === "arrowright" ? step : key === "arrowleft" ? -step : 0;
     const dp = key === "arrowup" ? (e.shiftKey ? 12 : 1) : key === "arrowdown" ? (e.shiftKey ? -12 : -1) : 0;
     apply({ cmd: "move_notes", track: t.id, notes: [...selNotes], delta_tick: dt, delta_pitch: dp });
+    if (dp !== 0) {
+      const first = t.notes.find((n) => selNotes.has(n.id));
+      if (first) {
+        activePreviewKey = first.pitch;
+        playNotePreview(t.id, first.pitch, 0.25, first.velocity);
+        setTimeout(() => {
+          if (activePreviewKey === first.pitch) {
+            activePreviewKey = null;
+            draw();
+          }
+        }, 220);
+      }
+    }
   }
 });
 

@@ -40,4 +40,4 @@ Kymion is edited **only through JSON commands**. Never hand-edit project files.
 - Types: `eq` (3-band parametric), `delay` (stereo ping-pong), `reverb` (algorithmic), `compressor`.
 - Control: `set_fx` (toggle bypass, adjust parameters), `remove_fx`.
 
-In the browser GUI the same protocol is available as `window.kymion.apply(cmd)`, `.project()`, `.schema()`, `.analysis()`, `.importMidi(bytes)`, `.exportMidi()`, `.meters()`.
+In the browser GUI the same protocol is available as `window.kymion.apply(cmd)`, `.project()`, `.schema()`, `.analysis()`, `.importMidi(bytes)`, `.exportMidi()`, `.meters()`, `.previewNote(track, pitch, dur, vel)`.

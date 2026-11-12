@@ -134,6 +134,23 @@ impl KymionEngine {
         let diag = kymion_audio::diagnose(&self.inner.project);
         serde_json::to_string(&diag).unwrap_or_else(|_| "{}".into())
     }
+    /// Render a single note audition preview for an interactive track (returns interleaved stereo f32).
+    pub fn preview_note(
+        &self,
+        track_id: u32,
+        pitch: u8,
+        duration_secs: f32,
+        velocity: u8,
+    ) -> Vec<f32> {
+        let s = kymion_audio::render_note_preview(
+            &self.inner.project,
+            track_id,
+            pitch,
+            duration_secs,
+            velocity,
+        );
+        interleave(&s)
+    }
     pub fn schema() -> String {
         command_schema()
     }
