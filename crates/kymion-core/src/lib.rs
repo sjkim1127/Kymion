@@ -8,6 +8,7 @@ pub mod midi;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Ticks per quarter note.
@@ -250,12 +251,15 @@ pub struct FxInstance {
 }
 
 /// Mono audio sample data embedded in the project (base64 of i16 LE PCM).
+///
+/// `data` is reference-counted so that cloning a [`Project`] (undo snapshots,
+/// GUI refreshes) never copies the embedded payload.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct AudioAsset {
     pub id: u32,
     pub name: String,
     pub sample_rate: u32,
-    pub data: String,
+    pub data: Arc<str>,
 }
 
 impl AudioAsset {
@@ -268,12 +272,12 @@ impl AudioAsset {
             id,
             name: name.into(),
             sample_rate,
-            data: B64.encode(bytes),
+            data: B64.encode(bytes).into(),
         }
     }
     /// Decode to f32 mono samples.
     pub fn samples(&self) -> Vec<f32> {
-        let bytes = B64.decode(&self.data).unwrap_or_default();
+        let bytes = B64.decode(self.data.as_bytes()).unwrap_or_default();
         let (chunks, _) = bytes.as_chunks::<2>();
         chunks
             .iter()
@@ -281,17 +285,21 @@ impl AudioAsset {
             .collect()
     }
     pub fn duration_secs(&self) -> f32 {
-        let n = B64.decode(&self.data).map(|b| b.len() / 2).unwrap_or(0);
+        let n = B64
+            .decode(self.data.as_bytes())
+            .map(|b| b.len() / 2)
+            .unwrap_or(0);
         n as f32 / self.sample_rate.max(1) as f32
     }
 }
 
 /// SoundFont 2 (.sf2) binary asset embedded in the project (base64).
+/// `data` is reference-counted so project clones stay cheap.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct SoundfontAsset {
     pub id: u32,
     pub name: String,
-    pub data: String,
+    pub data: Arc<str>,
 }
 
 impl SoundfontAsset {
@@ -299,12 +307,12 @@ impl SoundfontAsset {
         Self {
             id,
             name: name.into(),
-            data: B64.encode(bytes),
+            data: B64.encode(bytes).into(),
         }
     }
 
     pub fn bytes(&self) -> Vec<u8> {
-        B64.decode(&self.data).unwrap_or_default()
+        B64.decode(self.data.as_bytes()).unwrap_or_default()
     }
 }
 
@@ -554,6 +562,7 @@ pub struct Project {
     pub assets: Vec<AudioAsset>,
     #[serde(default)]
     pub soundfonts: Vec<SoundfontAsset>,
+    #[serde(default)]
     next_id: u32,
 }
 fn four() -> u8 {
@@ -646,7 +655,39 @@ impl Project {
         id
     }
     pub fn from_json(s: &str) -> Result<Self> {
-        Ok(serde_json::from_str(s)?)
+        let mut p: Self = serde_json::from_str(s)?;
+        p.fix_next_id();
+        Ok(p)
+    }
+    /// Make sure the id counter is above every id already present, so ids
+    /// handed out by [`Project::alloc`] can never collide with existing
+    /// tracks, notes, clips, effects or assets (e.g. after importing a MIDI
+    /// file or loading a hand-edited / older project file).
+    pub fn fix_next_id(&mut self) {
+        let mut max = 0u32;
+        let fx = |l: &[FxInstance], m: &mut u32| {
+            for f in l {
+                *m = (*m).max(f.id);
+            }
+        };
+        for t in &self.tracks {
+            max = max.max(t.id);
+            for n in &t.notes {
+                max = max.max(n.id);
+            }
+            for c in &t.clips {
+                max = max.max(c.id);
+            }
+            fx(&t.fx, &mut max);
+        }
+        fx(&self.master_fx, &mut max);
+        for a in &self.assets {
+            max = max.max(a.id);
+        }
+        for s in &self.soundfonts {
+            max = max.max(s.id);
+        }
+        self.next_id = self.next_id.max(max.saturating_add(1)).max(1);
     }
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("project serialises")
@@ -655,10 +696,10 @@ impl Project {
     pub fn to_json_light(&self) -> String {
         let mut p = self.clone();
         for a in &mut p.assets {
-            a.data.clear();
+            a.data = Arc::from("");
         }
         for sf in &mut p.soundfonts {
-            sf.data.clear();
+            sf.data = Arc::from("");
         }
         serde_json::to_string(&p).expect("project serialises")
     }
@@ -902,7 +943,8 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(project: Project) -> Self {
+    pub fn new(mut project: Project) -> Self {
+        project.fix_next_id();
         Self {
             project,
             ..Default::default()
@@ -1442,7 +1484,11 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
         }
         Command::AddSoundfont { name, data } => {
             let id = p.alloc();
-            p.soundfonts.push(SoundfontAsset { id, name, data });
+            p.soundfonts.push(SoundfontAsset {
+                id,
+                name,
+                data: data.into(),
+            });
             out.asset_id = Some(id);
         }
         Command::SetTrackSoundfont { track, soundfont } => {
@@ -1487,6 +1533,73 @@ pub fn command_schema() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_json_repairs_stale_id_counter() {
+        let mut e = Engine::default();
+        let t = e
+            .apply(Command::AddTrack {
+                name: "a".into(),
+                kind: TrackKind::Audio,
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
+        // Simulate a hand-edited / older file whose counter is too low or missing.
+        let mut v: serde_json::Value = serde_json::from_str(&e.project.to_json()).unwrap();
+        v["next_id"] = serde_json::json!(1);
+        let mut p = Project::from_json(&v.to_string()).unwrap();
+        assert!(p.alloc() > t);
+        v.as_object_mut().unwrap().remove("next_id");
+        let mut p = Project::from_json(&v.to_string()).unwrap();
+        assert!(p.alloc() > t);
+    }
+
+    #[test]
+    fn undo_snapshots_share_embedded_audio() {
+        let mut e = Engine::default();
+        e.import_audio("tone", 44100, &vec![0.25; 44100]);
+        e.import_soundfont("sf", b"RIFFfake");
+        let t = e
+            .apply(Command::AddTrack {
+                name: "i".into(),
+                kind: TrackKind::instrument(Waveform::Sine),
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
+        for i in 0..50 {
+            e.apply(Command::AddNote {
+                track: t,
+                start: i * 10,
+                duration: 10,
+                pitch: 60,
+                velocity: 100,
+                lyric: None,
+            })
+            .unwrap();
+        }
+        // snapshots taken before the imports hold no assets; every later one must share them
+        let with_assets: Vec<_> = e
+            .undo
+            .iter()
+            .filter(|s| !s.assets.is_empty() && !s.soundfonts.is_empty())
+            .collect();
+        assert!(with_assets.len() >= 50, "{}", with_assets.len());
+        for snap in with_assets {
+            assert!(Arc::ptr_eq(&snap.assets[0].data, &e.project.assets[0].data));
+            assert!(Arc::ptr_eq(
+                &snap.soundfonts[0].data,
+                &e.project.soundfonts[0].data
+            ));
+        }
+        // payload still round-trips through JSON and decodes
+        let back = Project::from_json(&e.project.to_json()).unwrap();
+        assert_eq!(back.assets[0].samples().len(), 44100);
+        assert_eq!(back.soundfonts[0].bytes(), b"RIFFfake");
+        // light JSON drops the payload
+        assert!(e.project.to_json_light().len() < e.project.to_json().len());
+    }
 
     #[test]
     fn add_undo_redo() {

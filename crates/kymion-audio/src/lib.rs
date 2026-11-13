@@ -999,6 +999,66 @@ pub fn detect_frequency_clashes(energies: &[TrackBandEnergy]) -> Vec<FrequencyCl
     clashes
 }
 
+/// Taps per polyphase branch of the true-peak interpolator (BS.1770-4 uses 12).
+const TP_TAPS: usize = 12;
+/// Samples before the interpolation point that the first tap reads.
+const TP_PRE: usize = TP_TAPS / 2 - 1;
+
+/// Polyphase windowed-sinc kernels for the three in-between positions (1/4, 2/4,
+/// 3/4) of a 4x oversampler. Each branch is normalised to unity DC gain.
+fn true_peak_kernel() -> [[f32; TP_TAPS]; 3] {
+    let half = (TP_TAPS / 2) as f64;
+    let mut k = [[0.0f32; TP_TAPS]; 3];
+    for (phase, row) in k.iter_mut().enumerate() {
+        let frac = (phase + 1) as f64 / 4.0;
+        let mut taps = [0.0f64; TP_TAPS];
+        for (j, t) in taps.iter_mut().enumerate() {
+            // distance (in samples) between the interpolation point and tap j
+            let d = frac - (j as f64 - TP_PRE as f64);
+            let x = std::f64::consts::PI * d;
+            let sinc = if x.abs() < 1e-9 { 1.0 } else { x.sin() / x };
+            let w = 0.42
+                + 0.5 * (std::f64::consts::PI * d / half).cos()
+                + 0.08 * (2.0 * std::f64::consts::PI * d / half).cos();
+            *t = sinc * w;
+        }
+        let sum: f64 = taps.iter().sum();
+        for (o, t) in row.iter_mut().zip(taps) {
+            *o = (t / sum) as f32;
+        }
+    }
+    k
+}
+
+/// Largest |value| of the interpolated points between the samples of `x`.
+fn oversampled_peak(x: &[f32], kernel: &[[f32; TP_TAPS]; 3]) -> f32 {
+    let len = x.len();
+    let mut peak = 0.0f32;
+    let at = |i: isize| -> f32 {
+        if i >= 0 && (i as usize) < len {
+            x[i as usize]
+        } else {
+            0.0
+        }
+    };
+    for n in 0..len.saturating_sub(1) {
+        let interior = n >= TP_PRE && n + TP_TAPS - TP_PRE <= len;
+        for row in kernel {
+            let acc: f32 = if interior {
+                let w = &x[n - TP_PRE..n - TP_PRE + TP_TAPS];
+                row.iter().zip(w).map(|(h, v)| h * v).sum()
+            } else {
+                row.iter()
+                    .enumerate()
+                    .map(|(j, h)| h * at(n as isize + j as isize - TP_PRE as isize))
+                    .sum()
+            };
+            peak = peak.max(acc.abs());
+        }
+    }
+    peak
+}
+
 /// Calculate ITU-R BS.1770-4 gated integrated loudness (LUFS), momentary max, short-term max, LRA, and True Peak.
 pub fn calc_lufs(s: &Stereo) -> LufsReport {
     let srf = s.sample_rate as f32;
@@ -1017,22 +1077,14 @@ pub fn calc_lufs(s: &Stereo) -> LufsReport {
         let sl = s.left[i];
         let sr_samp = s.right[i];
         true_peak = true_peak.max(sl.abs()).max(sr_samp.abs());
-
-        // 4x linear oversampling for inter-sample peak detection
-        if i + 1 < n {
-            let next_l = s.left[i + 1];
-            let next_r = s.right[i + 1];
-            for k in 1..4 {
-                let frac = k as f32 / 4.0;
-                let inter_l = sl + (next_l - sl) * frac;
-                let inter_r = sr_samp + (next_r - sr_samp) * frac;
-                true_peak = true_peak.max(inter_l.abs()).max(inter_r.abs());
-            }
-        }
-
         filtered_l.push(k_l.process(sl));
         filtered_r.push(k_r.process(sr_samp));
     }
+    // Inter-sample peaks via 4x oversampling (BS.1770-4 Annex 2 style).
+    let kernel = true_peak_kernel();
+    true_peak = true_peak
+        .max(oversampled_peak(&s.left[..n], &kernel))
+        .max(oversampled_peak(&s.right[..n], &kernel));
 
     let true_peak_db = if true_peak > 1e-6 {
         20.0 * true_peak.log10()
@@ -1370,6 +1422,54 @@ mod tests {
         })
         .unwrap();
         assert!(analyze(&render(&e.project)).peak < 1e-6);
+    }
+
+    #[test]
+    fn true_peak_sees_intersample_overs() {
+        // fs/4 sine at 45 degrees: every sample is +-0.7071 but the analog peak is 1.0.
+        let n = 44100;
+        let l: Vec<f32> = (0..n)
+            .map(|i| (std::f32::consts::FRAC_PI_2 * i as f32 + std::f32::consts::FRAC_PI_4).sin())
+            .collect();
+        let s = Stereo {
+            sample_rate: 44100,
+            left: l.clone(),
+            right: l,
+        };
+        let r = calc_lufs(&s);
+        assert!(
+            r.true_peak_db > -0.3 && r.true_peak_db < 0.3,
+            "true peak should be ~0 dBTP, got {}",
+            r.true_peak_db
+        );
+        // never below the sample peak
+        let sample_peak_db = 20.0 * std::f32::consts::FRAC_1_SQRT_2.log10();
+        assert!(r.true_peak_db > sample_peak_db + 2.0);
+    }
+
+    #[test]
+    fn true_peak_matches_sample_peak_for_smooth_signal_and_silence() {
+        // A 100 Hz sine is heavily oversampled already: true peak == sample peak.
+        let l: Vec<f32> = (0..44100)
+            .map(|i| 0.5 * (std::f32::consts::TAU * 100.0 * i as f32 / 44100.0).sin())
+            .collect();
+        let s = Stereo {
+            sample_rate: 44100,
+            right: vec![0.0; l.len()],
+            left: l,
+        };
+        let r = calc_lufs(&s);
+        assert!(
+            (r.true_peak_db - 20.0 * 0.5f32.log10()).abs() < 0.15,
+            "{}",
+            r.true_peak_db
+        );
+        let z = calc_lufs(&Stereo {
+            sample_rate: 44100,
+            left: vec![0.0; 4410],
+            right: vec![0.0; 4410],
+        });
+        assert_eq!(z.true_peak_db, -120.0);
     }
 
     #[test]

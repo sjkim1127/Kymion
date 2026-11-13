@@ -222,6 +222,8 @@ pub struct Adsr {
     level: f32,
     stage: u8,
     sr: f32,
+    /// Per-sample release decrement, fixed at `gate_off` from the level at that moment.
+    rel_step: f32,
 }
 impl Adsr {
     pub fn new(a: f32, d: f32, s: f32, r: f32, sr: f32) -> Self {
@@ -233,12 +235,16 @@ impl Adsr {
             level: 0.0,
             stage: 0,
             sr,
+            rel_step: 0.0,
         }
     }
     #[inline(always)]
     pub fn gate_off(&mut self) {
         if self.stage < 3 {
             self.stage = 3;
+            // Fall from the *current* level to zero in `r` seconds, regardless of
+            // the sustain level (a sustain of 0, e.g. plucks, must still release).
+            self.rel_step = self.level / (self.r * self.sr).max(1.0);
         }
     }
     #[inline(always)]
@@ -260,7 +266,7 @@ impl Adsr {
             }
             2 => {}
             _ => {
-                self.level -= self.s.max(0.001) / (self.r * self.sr).max(1.0);
+                self.level -= self.rel_step;
                 if self.level < 0.0 {
                     self.level = 0.0;
                 }
@@ -992,6 +998,44 @@ impl Noise {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn adsr_release_reaches_zero_even_with_zero_sustain() {
+        let sr = 44100.0;
+        // Pluck-style envelope released while still decaying (note shorter than decay).
+        let mut env = Adsr::new(0.002, 0.4, 0.0, 0.15, sr);
+        for _ in 0..(0.1 * sr) as usize {
+            env.next();
+        }
+        let at_gate_off = env.next();
+        assert!(
+            at_gate_off > 0.5,
+            "still decaying at gate-off: {at_gate_off}"
+        );
+        env.gate_off();
+        // after the release time (+ margin) the level must be exactly zero
+        let mut last = at_gate_off;
+        for _ in 0..(0.16 * sr) as usize {
+            let v = env.next();
+            assert!(v <= last + 1e-6, "release must be monotonic");
+            last = v;
+        }
+        assert_eq!(last, 0.0);
+    }
+    #[test]
+    fn adsr_release_from_sustain_unchanged() {
+        let sr = 44100.0;
+        let mut env = Adsr::new(0.01, 0.1, 0.7, 0.25, sr);
+        for _ in 0..(0.5 * sr) as usize {
+            env.next();
+        }
+        env.gate_off();
+        let mut n = 0usize;
+        while env.next() > 0.0 {
+            n += 1;
+        }
+        let secs = n as f32 / sr;
+        assert!((secs - 0.25).abs() < 0.01, "release took {secs}s");
+    }
     #[test]
     fn a4_is_440() {
         assert!((midi_to_hz(69.0) - 440.0).abs() < 1e-3);

@@ -155,6 +155,13 @@ impl KymionEngine {
         command_schema()
     }
 
+    /// Render only if nothing is cached yet; keeps the current metronome setting.
+    fn ensure_any_render(&mut self) {
+        if self.cache.is_none() {
+            self.ensure_render(self.cache_metro);
+        }
+    }
+
     fn ensure_render(&mut self, metronome: bool) {
         if self.cache.is_none() || self.cache_metro != metronome {
             self.cache = Some(render_full(
@@ -211,12 +218,60 @@ impl KymionEngine {
 
     /// Calculate RMS and peak meters for master and all tracks at the given sample slice.
     pub fn meter_levels(&mut self, start_sample: u32, num_samples: u32) -> String {
-        self.ensure_render(false);
+        // Meters are polled every few frames during playback: reuse whatever render
+        // is cached (metronome on or off) instead of forcing a re-render each time.
+        self.ensure_any_render();
         let m = self
             .cache
             .as_ref()
             .unwrap()
             .meters_at(start_sample as usize, num_samples as usize);
         serde_json::to_string(&m).unwrap_or_else(|_| "{}".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine_with_note() -> KymionEngine {
+        let mut e = KymionEngine::new("t");
+        e.apply(r#"{"cmd":"add_track","name":"a","kind":{"type":"instrument","waveform":"sine"}}"#)
+            .unwrap();
+        e.apply(r#"{"cmd":"add_note","track":1,"start":0,"duration":480,"pitch":60,"lyric":null}"#)
+            .unwrap();
+        e
+    }
+
+    #[test]
+    fn meter_polling_does_not_invalidate_metronome_render() {
+        let mut e = engine_with_note();
+        let _ = e.render_slice(0, 1024, true);
+        assert!(e.cache_metro);
+        let ptr = e.cache.as_ref().unwrap().master.left.as_ptr();
+
+        // Playback loop: meter poll interleaved with slice fetches.
+        for i in 0..5 {
+            let _ = e.meter_levels(i * 1024, 2048);
+            let _ = e.render_slice(i * 1024, 1024, true);
+        }
+        assert!(
+            e.cache_metro,
+            "meter_levels must not flip the metronome flag"
+        );
+        assert_eq!(
+            ptr,
+            e.cache.as_ref().unwrap().master.left.as_ptr(),
+            "render cache must not be rebuilt by meter polling"
+        );
+    }
+
+    #[test]
+    fn meter_levels_renders_when_cache_empty() {
+        let mut e = engine_with_note();
+        assert!(e.cache.is_none());
+        let json = e.meter_levels(0, 2048);
+        assert!(json.contains("master"));
+        assert!(e.cache.is_some());
     }
 }

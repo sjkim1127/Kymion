@@ -46,8 +46,6 @@ pub fn import_midi(bytes: &[u8]) -> Result<Project> {
         }
     }
 
-    let mut track_id = 1u32;
-
     for (t_idx, smf_track) in smf.tracks.iter().enumerate() {
         let mut cur_tick = 0u64;
         let mut track_name = format!("Track {}", t_idx + 1);
@@ -141,9 +139,9 @@ pub fn import_midi(bytes: &[u8]) -> Result<Project> {
 
         notes.sort_by_key(|n| (n.start, n.pitch));
 
-        // Assign note IDs and attach lyrics
-        for (next_note_id, n) in (1u32..).zip(notes.iter_mut()) {
-            n.id = next_note_id;
+        // Assign project-unique note IDs (shared counter with tracks) and attach lyrics
+        for n in notes.iter_mut() {
+            n.id = project.alloc();
 
             // Find closest lyric within 120 ticks
             if let Some((&lyric_tick, lyric_str)) = lyrics
@@ -166,11 +164,10 @@ pub fn import_midi(bytes: &[u8]) -> Result<Project> {
             TrackKind::instrument(Waveform::Pluck)
         };
 
+        let track_id = project.alloc();
         let mut trk = Track::new(track_id, track_name, kind);
         trk.notes = notes;
         project.tracks.push(trk);
-
-        track_id += 1;
     }
 
     if project.tracks.is_empty() {
@@ -345,5 +342,59 @@ mod tests {
         assert_eq!(imported.tracks[0].notes.len(), 2);
         assert_eq!(imported.tracks[0].notes[0].pitch, 60);
         assert_eq!(imported.tracks[0].notes[1].pitch, 62);
+    }
+
+    #[test]
+    fn imported_ids_are_unique_and_do_not_collide_with_new_ids() {
+        let mut p = Project::new("ids");
+        for n in 0..3 {
+            let tid = p.alloc();
+            let mut t = Track::new(tid, format!("T{n}"), TrackKind::instrument(Waveform::Sine));
+            for k in 0..2 {
+                let nid = p.alloc();
+                t.notes.push(Note {
+                    id: nid,
+                    start: k * 480,
+                    duration: 240,
+                    pitch: 60 + k as u8,
+                    velocity: 100,
+                    lyric: None,
+                    expression: None,
+                });
+            }
+            p.tracks.push(t);
+        }
+        let bytes = export_midi(&p).unwrap();
+        let mut e = crate::Engine::new(import_midi(&bytes).unwrap());
+
+        let mut ids: Vec<u32> = e.project.tracks.iter().map(|t| t.id).collect();
+        ids.extend(
+            e.project
+                .tracks
+                .iter()
+                .flat_map(|t| t.notes.iter().map(|n| n.id)),
+        );
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            ids.len(),
+            "duplicate ids after import: {ids:?}"
+        );
+
+        // ids handed out afterwards must not collide with anything imported
+        let new_id = e
+            .apply(crate::Command::AddTrack {
+                name: "new".into(),
+                kind: TrackKind::Audio,
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
+        assert!(
+            !ids.contains(&new_id),
+            "new id {new_id} collides with {ids:?}"
+        );
     }
 }
