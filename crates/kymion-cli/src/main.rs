@@ -120,6 +120,7 @@ fn run(cli: Cli) -> Result<Value, String> {
     };
     match cli.cmd {
         Cmd::New { path, name, tempo } => {
+            kymion_core::validate_tempo(tempo).map_err(|e| e.to_string())?;
             let mut p = Project::new(name);
             p.tempo = tempo;
             std::fs::write(&path, p.to_json()).map_err(|e| e.to_string())?;

@@ -1,6 +1,6 @@
 //! Standard MIDI File (.mid) import and export using `midly`.
 
-use crate::{Error, Note, Project, Result, Track, TrackKind, Waveform, PPQ};
+use crate::{Error, Note, Project, Result, Track, TrackKind, Waveform, MAX_TEMPO, MIN_TEMPO, PPQ};
 use midly::{
     num::{u24, u28, u4, u7},
     Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind,
@@ -20,30 +20,35 @@ pub fn import_midi(bytes: &[u8]) -> Result<Project> {
     };
     let tick_scale = PPQ as f32 / file_ppq.max(1.0);
 
-    // Scan tempo first
+    // Tempo / time signature: use the earliest event in the file (ties go to the
+    // first track), not whichever track happens to be scanned last.
+    let mut tempo: Option<(u64, u32)> = None;
+    let mut time_sig: Option<(u64, u8, u8)> = None;
     for track in &smf.tracks {
+        let mut abs = 0u64;
         for event in track {
-            if let TrackEventKind::Meta(MetaMessage::Tempo(t)) = event.kind {
-                let us_per_beat = t.as_int();
-                if us_per_beat > 0 {
-                    let bpm = 60_000_000.0 / us_per_beat as f32;
-                    project.tempo = bpm.clamp(20.0, 400.0);
-                    break;
+            abs += event.delta.as_int() as u64;
+            match event.kind {
+                TrackEventKind::Meta(MetaMessage::Tempo(t))
+                    if t.as_int() > 0 && tempo.is_none_or(|(at, _)| abs < at) =>
+                {
+                    tempo = Some((abs, t.as_int()));
                 }
+                TrackEventKind::Meta(MetaMessage::TimeSignature(n, d_pow, _, _))
+                    if (1..=32).contains(&n) && time_sig.is_none_or(|(at, _, _)| abs < at) =>
+                {
+                    time_sig = Some((abs, n, 1u8 << d_pow.min(4)));
+                }
+                _ => {}
             }
         }
     }
-
-    for track in &smf.tracks {
-        for event in track {
-            if let TrackEventKind::Meta(MetaMessage::TimeSignature(n, d_pow, _, _)) = event.kind {
-                let den = 1u8 << d_pow.min(4);
-                if n > 0 && n <= 32 {
-                    project.time_sig_num = n;
-                    project.time_sig_den = den;
-                }
-            }
-        }
+    if let Some((_, us)) = tempo {
+        project.tempo = (60_000_000.0 / us as f32).clamp(MIN_TEMPO, MAX_TEMPO);
+    }
+    if let Some((_, n, den)) = time_sig {
+        project.time_sig_num = n;
+        project.time_sig_den = den;
     }
 
     for (t_idx, smf_track) in smf.tracks.iter().enumerate() {
@@ -241,7 +246,7 @@ pub fn export_midi(project: &Project) -> Result<Vec<u8>> {
 
             // Note Off
             events.push((
-                note.start + note.duration,
+                note.start.saturating_add(note.duration),
                 TrackEventKind::Midi {
                     channel,
                     message: MidiMessage::NoteOff {
@@ -342,6 +347,60 @@ mod tests {
         assert_eq!(imported.tracks[0].notes.len(), 2);
         assert_eq!(imported.tracks[0].notes[0].pitch, 60);
         assert_eq!(imported.tracks[0].notes[1].pitch, 62);
+    }
+
+    fn two_track_tempo_file(first: (u32, f32), second: (u32, f32)) -> Vec<u8> {
+        use midly::num::u15;
+        let mut smf = Smf::new(Header::new(
+            Format::Parallel,
+            Timing::Metrical(u15::from(480)),
+        ));
+        for (tick, bpm) in [first, second] {
+            let us = (60_000_000.0 / bpm) as u32;
+            smf.tracks.push(vec![
+                TrackEvent {
+                    delta: u28::from(tick),
+                    kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::from(us))),
+                },
+                TrackEvent {
+                    delta: u28::from(0u32),
+                    kind: TrackEventKind::Midi {
+                        channel: u4::from(0u8),
+                        message: MidiMessage::NoteOn {
+                            key: u7::from(60u8),
+                            vel: u7::from(90u8),
+                        },
+                    },
+                },
+                TrackEvent {
+                    delta: u28::from(480u32),
+                    kind: TrackEventKind::Midi {
+                        channel: u4::from(0u8),
+                        message: MidiMessage::NoteOff {
+                            key: u7::from(60u8),
+                            vel: u7::from(0u8),
+                        },
+                    },
+                },
+                TrackEvent {
+                    delta: u28::from(0u32),
+                    kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+                },
+            ]);
+        }
+        let mut buf = Vec::new();
+        smf.write(&mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn import_uses_earliest_tempo_event_not_last_track() {
+        // both at tick 0: the first track wins
+        let p = import_midi(&two_track_tempo_file((0, 100.0), (0, 150.0))).unwrap();
+        assert!((p.tempo - 100.0).abs() < 0.1, "{}", p.tempo);
+        // the second track's tempo comes first in time: it wins
+        let p = import_midi(&two_track_tempo_file((960, 100.0), (0, 150.0))).unwrap();
+        assert!((p.tempo - 150.0).abs() < 0.1, "{}", p.tempo);
     }
 
     #[test]

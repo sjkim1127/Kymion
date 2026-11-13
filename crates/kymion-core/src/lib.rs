@@ -13,6 +13,23 @@ use thiserror::Error;
 
 /// Ticks per quarter note.
 pub const PPQ: u32 = 480;
+/// Accepted tempo range in BPM.
+pub const MIN_TEMPO: f32 = 20.0;
+pub const MAX_TEMPO: f32 = 400.0;
+/// Accepted project sample-rate range in Hz.
+pub const MIN_SAMPLE_RATE: u32 = 8_000;
+pub const MAX_SAMPLE_RATE: u32 = 384_000;
+
+/// Check a tempo in BPM (rejects NaN, zero, negative and out-of-range values).
+pub fn validate_tempo(bpm: f32) -> Result<()> {
+    if (MIN_TEMPO..=MAX_TEMPO).contains(&bpm) {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!(
+            "bpm must be {MIN_TEMPO}..{MAX_TEMPO}"
+        )))
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -625,14 +642,14 @@ impl Project {
             .tracks
             .iter()
             .flat_map(|t| &t.notes)
-            .map(|n| n.start + n.duration)
+            .map(|n| n.start.saturating_add(n.duration))
             .max()
             .unwrap_or(0);
         let clips = self
             .tracks
             .iter()
             .flat_map(|t| &t.clips)
-            .map(|c| c.start + self.clip_len_ticks(c))
+            .map(|c| c.start.saturating_add(self.clip_len_ticks(c)))
             .max()
             .unwrap_or(0);
         notes.max(clips)
@@ -656,6 +673,12 @@ impl Project {
     }
     pub fn from_json(s: &str) -> Result<Self> {
         let mut p: Self = serde_json::from_str(s)?;
+        validate_tempo(p.tempo)?;
+        if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&p.sample_rate) {
+            return Err(Error::Invalid(format!(
+                "sample_rate must be {MIN_SAMPLE_RATE}..{MAX_SAMPLE_RATE}"
+            )));
+        }
         p.fix_next_id();
         Ok(p)
     }
@@ -916,6 +939,14 @@ fn vel() -> u8 {
     100
 }
 
+/// A note must end at a tick representable as u32 (`start + duration`).
+fn check_tick_range(start: u32, duration: u32) -> Result<()> {
+    start
+        .checked_add(duration)
+        .map(|_| ())
+        .ok_or_else(|| Error::Invalid("start + duration exceeds the maximum tick".into()))
+}
+
 /// Result of applying a command (ids created, etc.), JSON-friendly for agents.
 #[derive(Clone, Debug, Serialize, Default)]
 pub struct Outcome {
@@ -1012,9 +1043,7 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
     };
     match cmd {
         Command::SetTempo { bpm } => {
-            if !(20.0..=400.0).contains(&bpm) {
-                return Err(Error::Invalid("bpm must be 20..400".into()));
-            }
+            validate_tempo(bpm)?;
             p.tempo = bpm;
         }
         Command::SetName { name } => p.name = name,
@@ -1059,6 +1088,7 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
             if duration == 0 || pitch > 127 || velocity > 127 {
                 return Err(Error::Invalid("duration>0, pitch/velocity 0..127".into()));
             }
+            check_tick_range(start, duration)?;
             let id = p.alloc();
             let t = p.track_mut(track)?;
             t.notes.push(Note {
@@ -1109,6 +1139,7 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
                 }
                 n.duration = d;
             }
+            check_tick_range(n.start, n.duration)?;
             t.notes.sort_by_key(|n| (n.start, n.pitch));
         }
         Command::SetLyrics { track, lyrics } => {
@@ -1140,7 +1171,9 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
             }
             let t = p.track_mut(track)?;
             for n in &mut t.notes {
-                n.start = (n.start + grid / 2) / grid * grid;
+                let q = n.start.saturating_add(grid / 2) / grid * grid;
+                // rounding up must not push the end past the u32 tick range
+                n.start = q.min(u32::MAX - n.duration);
             }
             t.notes.sort_by_key(|n| (n.start, n.pitch));
         }
@@ -1177,6 +1210,7 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
                 if n.duration == 0 || n.pitch > 127 || n.velocity > 127 {
                     return Err(Error::Invalid("duration>0, pitch/velocity 0..127".into()));
                 }
+                check_tick_range(n.start, n.duration)?;
             }
             p.track(track)?;
             for n in notes {
@@ -1219,7 +1253,9 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
                 }
             }
             for n in t.notes.iter_mut().filter(|n| notes.contains(&n.id)) {
-                n.start = (n.start as i64 + delta_tick as i64).max(0) as u32;
+                // keep start + duration inside u32 range
+                let max_start = (u32::MAX - n.duration) as i64;
+                n.start = (n.start as i64 + delta_tick as i64).clamp(0, max_start) as u32;
                 n.pitch = (n.pitch as i16 + delta_pitch as i16).clamp(0, 127) as u8;
             }
             t.notes.sort_by_key(|n| (n.start, n.pitch));
@@ -1245,13 +1281,14 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
                 .iter_mut()
                 .find(|x| x.id == note)
                 .ok_or(Error::NoteNotFound(note))?;
-            if at <= n.start || at >= n.start + n.duration {
+            let end = n.start.saturating_add(n.duration);
+            if at <= n.start || at >= end {
                 return Err(Error::Invalid("split point must be inside the note".into()));
             }
             let tail = Note {
                 id: new_id,
                 start: at,
-                duration: n.start + n.duration - at,
+                duration: end - at,
                 pitch: n.pitch,
                 velocity: n.velocity,
                 lyric: None,
@@ -1373,7 +1410,7 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
                     .iter_mut()
                     .find(|c| c.id == clip)
                     .ok_or(Error::ClipNotFound(clip))?;
-                if at <= c.start || at >= c.start + clip_len {
+                if at <= c.start || at >= c.start.saturating_add(clip_len) {
                     return Err(Error::Invalid(
                         "split point must be strictly inside the clip".into(),
                     ));
@@ -1394,7 +1431,7 @@ fn apply_inner(p: &mut Project, cmd: Command) -> Result<Outcome> {
                 asset,
                 start: at,
                 gain,
-                offset_ticks: offset_ticks + delta,
+                offset_ticks: offset_ticks.saturating_add(delta),
                 duration_ticks: Some(rem),
                 fade_in_ticks: 0,
                 fade_out_ticks,
@@ -1533,6 +1570,103 @@ pub fn command_schema() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_json_rejects_invalid_tempo_and_sample_rate() {
+        let base = Project::new("x").to_json();
+        let with = |k: &str, v: serde_json::Value| {
+            let mut j: serde_json::Value = serde_json::from_str(&base).unwrap();
+            j[k] = v;
+            Project::from_json(&j.to_string())
+        };
+        assert!(with("tempo", serde_json::json!(0.0)).is_err());
+        assert!(with("tempo", serde_json::json!(-50.0)).is_err());
+        assert!(with("tempo", serde_json::json!(1000.0)).is_err());
+        assert!(with("sample_rate", serde_json::json!(0)).is_err());
+        assert!(with("tempo", serde_json::json!(140.0)).is_ok());
+        assert!(validate_tempo(f32::NAN).is_err());
+    }
+
+    #[test]
+    fn tick_arithmetic_never_overflows() {
+        let mut e = Engine::default();
+        let t = e
+            .apply(Command::AddTrack {
+                name: "t".into(),
+                kind: TrackKind::instrument(Waveform::Sine),
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
+        let add = |e: &mut Engine, start: u32, duration: u32| {
+            e.apply(Command::AddNote {
+                track: t,
+                start,
+                duration,
+                pitch: 60,
+                velocity: 100,
+                lyric: None,
+            })
+        };
+        // start + duration > u32::MAX is rejected, not wrapped
+        assert!(add(&mut e, u32::MAX - 10, 100).is_err());
+        assert!(e.project.tracks[0].notes.is_empty());
+        // the largest representable note is accepted and every derived calculation survives it
+        let o = add(&mut e, u32::MAX - 100, 100).unwrap();
+        assert_eq!(e.project.length_ticks(), u32::MAX);
+        e.apply(Command::Quantize {
+            track: t,
+            grid: 480,
+        })
+        .unwrap();
+        let note = o.note_id.unwrap();
+        let (start, dur) = {
+            let n = &e.project.tracks[0].notes[0];
+            (n.start, n.duration)
+        };
+        assert!(start.checked_add(dur).is_some());
+        e.apply(Command::SplitNote {
+            track: t,
+            note,
+            at: start + 50,
+        })
+        .unwrap();
+        // moving far to the right clamps instead of wrapping
+        let ids: Vec<u32> = e.project.tracks[0].notes.iter().map(|n| n.id).collect();
+        e.apply(Command::MoveNotes {
+            track: t,
+            notes: ids,
+            delta_tick: i32::MAX,
+            delta_pitch: 0,
+        })
+        .unwrap();
+        for n in &e.project.tracks[0].notes {
+            assert!(n.start.checked_add(n.duration).is_some());
+        }
+        // batch and single move enforce the same rule
+        assert!(e
+            .apply(Command::AddNotes {
+                track: t,
+                notes: vec![NewNote {
+                    start: u32::MAX,
+                    duration: 1,
+                    pitch: 60,
+                    velocity: 100,
+                    lyric: None
+                }],
+            })
+            .is_err());
+        let id = e.project.tracks[0].notes[0].id;
+        assert!(e
+            .apply(Command::MoveNote {
+                track: t,
+                note: id,
+                start: Some(u32::MAX),
+                pitch: None,
+                duration: Some(10),
+            })
+            .is_err());
+    }
 
     #[test]
     fn from_json_repairs_stale_id_counter() {

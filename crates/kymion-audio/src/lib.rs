@@ -34,11 +34,23 @@ pub fn list_soundfont_presets(bytes: &[u8]) -> Vec<SoundfontPresetInfo> {
         .collect()
 }
 
+/// Level of the mix *before* the master soft limiter, which compresses every
+/// sample (|x| < 1 after `tanh`) and would otherwise hide overs from analysis.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LimiterStats {
+    /// Largest |sample| seen before limiting.
+    pub peak: f32,
+    /// Samples whose pre-limiter magnitude reached full scale (>= 1.0).
+    pub over_samples: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct Stereo {
     pub sample_rate: u32,
     pub left: Vec<f32>,
     pub right: Vec<f32>,
+    /// Pre-limiter statistics; `Some` only for buffers produced by the master render.
+    pub limiter: Option<LimiterStats>,
 }
 
 #[derive(Debug, Serialize)]
@@ -46,7 +58,12 @@ pub struct Analysis {
     pub duration_sec: f32,
     pub peak: f32,
     pub rms: f32,
+    /// Samples that reached full scale (>= 1.0) *before* the master soft limiter.
+    /// For buffers without limiter statistics: samples at >= 0.999 in the buffer.
     pub clipped_samples: usize,
+    /// Peak level before the master soft limiter (can exceed 1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_limiter_peak: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lufs: Option<LufsReport>,
 }
@@ -208,7 +225,7 @@ fn render_soundfont_into(
     let mut events: Vec<(usize, MidiEvt)> = Vec::with_capacity(t.notes.len() * 2);
     for n in &t.notes {
         let on = (p.ticks_to_secs(n.start) * srf) as usize;
-        let off = (p.ticks_to_secs(n.start + n.duration) * srf) as usize;
+        let off = (p.ticks_to_secs(n.start.saturating_add(n.duration)) * srf) as usize;
         if on < total_samples {
             events.push((
                 on,
@@ -347,6 +364,7 @@ pub fn render_note_preview(
             sample_rate: sr,
             left,
             right,
+            limiter: None,
         };
     };
 
@@ -401,6 +419,7 @@ pub fn render_note_preview(
         sample_rate: sr,
         left,
         right,
+        limiter: None,
     }
 }
 
@@ -723,6 +742,12 @@ impl FullRender {
     }
 }
 
+/// Constant-power pan law: `pan` in -1..1 -> (left, right) gains; centre is -3 dB per side.
+fn pan_gains(pan: f32) -> (f32, f32) {
+    let a = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
+    (a.cos(), a.sin())
+}
+
 /// Render the whole project to stereo including track and master FX chains.
 pub fn render(p: &Project) -> Stereo {
     render_with(p, &RenderOptions::default())
@@ -778,39 +803,32 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
             TrackKind::Audio => render_audio_track_into(p, t, sr, &mut mono),
         };
 
-        let static_pan = {
-            let a = (t.pan + 1.0) * std::f32::consts::FRAC_PI_4;
-            (a.cos(), a.sin())
-        };
+        let static_pan = pan_gains(t.pan);
         let automated = !t.gain_auto.is_empty() || !t.pan_auto.is_empty();
+        // Same gain + constant-power pan law for every track kind (mono sources and
+        // already-stereo SoundFont output), so equal settings sound equally loud.
+        let gain_pan_at = |i: usize| -> (f32, (f32, f32)) {
+            if automated {
+                let tick = i as f32 * ticks_per_sample;
+                (
+                    eval_auto(&t.gain_auto, tick, t.gain),
+                    pan_gains(eval_auto(&t.pan_auto, tick, t.pan)),
+                )
+            } else {
+                (t.gain, static_pan)
+            }
+        };
 
         if is_stereo {
             for i in 0..total_samples {
-                let (gain, pan) = if automated {
-                    let tick = i as f32 * ticks_per_sample;
-                    let g = eval_auto(&t.gain_auto, tick, t.gain);
-                    let p_val = eval_auto(&t.pan_auto, tick, t.pan);
-                    (g, p_val)
-                } else {
-                    (t.gain, t.pan)
-                };
-                let l_pan = if pan <= 0.0 { 1.0 } else { 1.0 - pan };
-                let r_pan = if pan >= 0.0 { 1.0 } else { 1.0 + pan };
-                trk_l[i] = trk_l[i] * gain * l_pan;
-                trk_r[i] = trk_r[i] * gain * r_pan;
+                let (gain, (pl, pr)) = gain_pan_at(i);
+                trk_l[i] *= gain * pl;
+                trk_r[i] *= gain * pr;
             }
         } else {
             for i in 0..total_samples {
                 let s = mono[i];
-                let (gain, (pl, pr)) = if automated {
-                    let tick = i as f32 * ticks_per_sample;
-                    let g = eval_auto(&t.gain_auto, tick, t.gain);
-                    let pan = eval_auto(&t.pan_auto, tick, t.pan);
-                    let a = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
-                    (g, (a.cos(), a.sin()))
-                } else {
-                    (t.gain, static_pan)
-                };
+                let (gain, (pl, pr)) = gain_pan_at(i);
                 trk_l[i] = s * gain * pl;
                 trk_r[i] = s * gain * pr;
             }
@@ -837,8 +855,16 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
         add_metronome(p, &mut master_l, &mut master_r, sr);
     }
 
-    // Soft limiter on master output
+    // Soft limiter on master output (record pre-limiter level so overs stay visible)
+    let mut limiter = LimiterStats::default();
     for s in master_l.iter_mut().chain(master_r.iter_mut()) {
+        let a = s.abs();
+        if a > limiter.peak {
+            limiter.peak = a;
+        }
+        if a >= 1.0 {
+            limiter.over_samples += 1;
+        }
         *s = s.tanh();
     }
 
@@ -847,6 +873,7 @@ pub fn render_full(p: &Project, opts: &RenderOptions) -> FullRender {
             sample_rate: sr,
             left: master_l,
             right: master_r,
+            limiter: Some(limiter),
         },
         track_meters,
         track_energies,
@@ -1230,11 +1257,16 @@ pub fn analyze(s: &Stereo) -> Analysis {
         }
     }
     let lufs = Some(calc_lufs(s));
+    let (clipped_samples, pre_limiter_peak) = match s.limiter {
+        Some(l) => (l.over_samples, Some(l.peak)),
+        None => (clip, None),
+    };
     Analysis {
         duration_sec: n as f32 / s.sample_rate as f32,
         peak,
         rms: (sum / (2 * n) as f64).sqrt() as f32,
-        clipped_samples: clip,
+        clipped_samples,
+        pre_limiter_peak,
         lufs,
     }
 }
@@ -1435,6 +1467,7 @@ mod tests {
             sample_rate: 44100,
             left: l.clone(),
             right: l,
+            limiter: None,
         };
         let r = calc_lufs(&s);
         assert!(
@@ -1457,6 +1490,7 @@ mod tests {
             sample_rate: 44100,
             right: vec![0.0; l.len()],
             left: l,
+            limiter: None,
         };
         let r = calc_lufs(&s);
         assert!(
@@ -1468,8 +1502,66 @@ mod tests {
             sample_rate: 44100,
             left: vec![0.0; 4410],
             right: vec![0.0; 4410],
+            limiter: None,
         });
         assert_eq!(z.true_peak_db, -120.0);
+    }
+
+    #[test]
+    fn pan_law_is_constant_power_and_symmetric() {
+        let (l, r) = pan_gains(0.0);
+        assert!((l - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        assert!((r - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        for pan in [-1.0f32, -0.5, 0.0, 0.3, 1.0, 5.0, -5.0] {
+            let (l, r) = pan_gains(pan);
+            assert!((l * l + r * r - 1.0).abs() < 1e-5, "pan {pan}");
+        }
+        let (l, r) = pan_gains(-1.0);
+        assert!(l > 0.999 && r < 1e-3);
+    }
+
+    #[test]
+    fn overs_are_reported_despite_soft_limiter() {
+        let mk = |tracks: usize| {
+            let mut e = Engine::default();
+            for _ in 0..tracks {
+                let t = e
+                    .apply(Command::AddTrack {
+                        name: "s".into(),
+                        kind: TrackKind::instrument(Waveform::Sine),
+                    })
+                    .unwrap()
+                    .track_id
+                    .unwrap();
+                e.apply(Command::SetMix {
+                    track: t,
+                    gain: Some(2.0),
+                    pan: None,
+                    mute: None,
+                    solo: None,
+                })
+                .unwrap();
+                e.apply(Command::AddNote {
+                    track: t,
+                    start: 0,
+                    duration: 1920,
+                    pitch: 69,
+                    velocity: 127,
+                    lyric: None,
+                })
+                .unwrap();
+            }
+            analyze(&render(&e.project))
+        };
+        let quiet = mk(1);
+        assert_eq!(quiet.clipped_samples, 0);
+        assert!(quiet.pre_limiter_peak.unwrap() < 1.0);
+        // four full-scale tracks sum to ~2.8 before the limiter: the output peak stays
+        // below 1.0 but the overs must still be counted
+        let loud = mk(4);
+        assert!(loud.peak < 1.0, "limited output stays below full scale");
+        assert!(loud.pre_limiter_peak.unwrap() > 1.5, "{loud:?}");
+        assert!(loud.clipped_samples > 0, "{loud:?}");
     }
 
     #[test]
@@ -1478,6 +1570,7 @@ mod tests {
             sample_rate: 22050,
             left: vec![0.5; 100],
             right: vec![0.5; 100],
+            limiter: None,
         };
         let (sr, mono) = decode_wav(&to_wav_bytes(&s)).unwrap();
         assert_eq!(sr, 22050);

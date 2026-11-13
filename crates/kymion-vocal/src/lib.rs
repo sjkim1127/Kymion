@@ -209,7 +209,7 @@ pub fn render_track(project: &Project, track: &Track, voice: &dyn Voice, sr: u32
             .clone()
             .unwrap_or_else(|| track.expression.clone());
         let from = match prev {
-            Some((p, end)) if note.start <= end + 60 => p.pitch as f32,
+            Some((p, end)) if note.start <= end.saturating_add(60) => p.pitch as f32,
             _ => note.pitch as f32,
         };
         let req = NoteRequest {
@@ -227,7 +227,7 @@ pub fn render_track(project: &Project, track: &Track, voice: &dyn Voice, sr: u32
                 *b += s;
             }
         }
-        prev = Some((note, note.start + note.duration));
+        prev = Some((note, note.start.saturating_add(note.duration)));
     }
     buf
 }

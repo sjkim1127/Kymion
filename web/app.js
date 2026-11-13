@@ -98,7 +98,7 @@ window.kymion = {
   importMidi: (bytes) => { eng = KymionEngine.import_midi(bytes); refresh(); },
   exportMidi: () => eng.export_midi(),
   play: () => play(), stop: () => stopAll(), get playhead() { return curTick(); },
-  meters: () => JSON.parse(eng.meter_levels(streamPos, 2048)),
+  meters: () => JSON.parse(eng.meter_levels(foldLoopSamples(streamPos), 2048)),
   previewNote: (trackId, pitch, duration, velocity) => playNotePreview(trackId, pitch, duration, velocity),
 };
 
@@ -785,12 +785,25 @@ async function initWorklet() {
   }
 }
 
+// The worklet reports an ever-increasing sample count while render_slice() wraps the
+// audio inside the loop region. Fold the count the same way so the playhead and the
+// meters follow what is actually heard instead of running past the loop end.
+function foldLoopSamples(pos) {
+  const lr = P?.loop_region;
+  if (!lr) return pos;
+  const sr = eng.sample_rate();
+  const ls = Math.floor(lr.start * spt() * sr);
+  const le = Math.floor(lr.end * spt() * sr);
+  return le > ls && pos >= le ? ls + ((pos - ls) % (le - ls)) : pos;
+}
+
 function onWorkletMessage(msg) {
   if (msg.type === "status") {
     workletBuffered = msg.buffered;
     if (msg.playing) {
       const sr = eng.sample_rate();
-      playhead = (msg.totalSamples / sr) / spt();
+      const heardPos = foldLoopSamples(msg.totalSamples);
+      playhead = (heardPos / sr) / spt();
       updatePos();
 
       // Master meter display
@@ -805,7 +818,7 @@ function onWorkletMessage(msg) {
       if (now - lastMeterUpdate > 45) {
         lastMeterUpdate = now;
         try {
-          const metersJson = eng.meter_levels(msg.totalSamples, 2048);
+          const metersJson = eng.meter_levels(heardPos, 2048);
           const m = JSON.parse(metersJson);
           if (m.tracks) {
             for (const [tid, tMeter] of Object.entries(m.tracks)) {

@@ -7,7 +7,7 @@ Kymion is edited **only through JSON commands**. Never hand-edit project files.
 2. `kymion schema` — JSON Schema of every command (`cmd` tag).
 3. `kymion apply song.kymion.json --stdin < cmds.json` — one object or an array; atomic (any failure ⇒ nothing written). Use `--dry-run` to validate.
 4. `kymion info song.kymion.json [--full]` — inspect ids/state.
-5. `kymion render song.kymion.json -o out.wav` — returns `analysis` (peak/rms/clipping/duration) so you can verify without listening.
+5. `kymion render song.kymion.json -o out.wav` — returns `analysis` (peak/rms/clipping/duration) so you can verify without listening. `clipped_samples` and `pre_limiter_peak` are measured *before* the master soft limiter (output `peak` is always < 1.0), so `clipped_samples > 0` means the mix overs full scale. Tempo must be 20..400 BPM.
 
 ## Standard MIDI File (SMF) & SoundFont (SF2) Interop
 - `kymion import-midi song.mid -o song.kymion.json` — imports tracks, notes, tempo, and lyric events.
