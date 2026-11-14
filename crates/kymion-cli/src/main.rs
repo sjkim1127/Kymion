@@ -83,8 +83,9 @@ enum Cmd {
     /// Import a Standard MIDI File (.mid) into a Kymion project.
     ImportMidi {
         midi_path: PathBuf,
+        /// Project file to write (required: importing without saving would do nothing).
         #[arg(short, long)]
-        out: Option<PathBuf>,
+        out: PathBuf,
     },
     /// Export a Kymion project to a Standard MIDI File (.mid).
     ExportMidi {
@@ -267,9 +268,7 @@ fn run(cli: Cli) -> Result<Value, String> {
             let bytes =
                 std::fs::read(&midi_path).map_err(|e| format!("{}: {e}", midi_path.display()))?;
             let project = import_midi(&bytes).map_err(|e| e.to_string())?;
-            if let Some(out_p) = &out {
-                std::fs::write(out_p, project.to_json()).map_err(|e| e.to_string())?;
-            }
+            std::fs::write(&out, project.to_json()).map_err(|e| e.to_string())?;
             Ok(json!({
                 "ok": true,
                 "name": project.name,
@@ -306,6 +305,25 @@ fn run(cli: Cli) -> Result<Value, String> {
                     .to_string()
             });
             let presets = kymion_audio::list_soundfont_presets(&bytes);
+            if presets.is_empty() {
+                return Err(format!(
+                    "{}: not a valid SoundFont 2 file (no presets found)",
+                    sf2.display()
+                ));
+            }
+            if track.is_some() && !presets.iter().any(|p| p.bank == bank && p.preset == preset) {
+                let avail: Vec<String> = presets
+                    .iter()
+                    .take(8)
+                    .map(|p| format!("bank {} preset {} ({})", p.bank, p.preset, p.name))
+                    .collect();
+                return Err(format!(
+                    "bank {bank} preset {preset} not found in {}; available: {}{}",
+                    sf2.display(),
+                    avail.join(", "),
+                    if presets.len() > 8 { ", ..." } else { "" }
+                ));
+            }
             let mut e = Engine::new(load(&project)?);
             let asset_id = e.import_soundfont(&sf_name, &bytes);
 
@@ -335,7 +353,25 @@ fn run(cli: Cli) -> Result<Value, String> {
 }
 
 fn main() {
-    match run(Cli::parse()) {
+    // Argument errors must follow the same protocol as every other failure: one JSON
+    // document on stdout and exit code 1. Help/version output stays human readable.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::ErrorKind;
+            if matches!(
+                e.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) {
+                e.exit();
+            }
+            println!("{}", json!({"ok": false, "error": e.to_string().trim()}));
+            std::process::exit(1);
+        }
+    };
+    match run(cli) {
         Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
         Err(e) => {
             println!("{}", json!({"ok": false, "error": e}));

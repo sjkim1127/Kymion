@@ -182,6 +182,13 @@ pub fn import_midi(bytes: &[u8]) -> Result<Project> {
     Ok(project)
 }
 
+/// MIDI channel for the `index`-th track. Channel 10 (index 9) is General MIDI percussion,
+/// so melodic tracks skip it: 0..=8, then 10..=15 (tracks beyond 15 share channels).
+fn midi_channel(index: usize) -> u4 {
+    let c = (index % 15) as u8;
+    u4::from(if c >= 9 { c + 1 } else { c })
+}
+
 /// Export a Kymion Project to Standard MIDI File (.mid) bytes.
 pub fn export_midi(project: &Project) -> Result<Vec<u8>> {
     let header = Header::new(
@@ -214,7 +221,7 @@ pub fn export_midi(project: &Project) -> Result<Vec<u8>> {
 
     // Data tracks
     for (t_idx, track) in project.tracks.iter().enumerate() {
-        let channel = u4::from((t_idx % 16) as u8);
+        let channel = midi_channel(t_idx);
         let mut events: Vec<(u32, TrackEventKind)> = Vec::new();
 
         // Track Name
@@ -257,25 +264,20 @@ pub fn export_midi(project: &Project) -> Result<Vec<u8>> {
             ));
         }
 
-        // Sort events chronologically (NoteOff before NoteOn if simultaneous)
-        events.sort_by(|a, b| {
-            a.0.cmp(&b.0).then_with(|| match (&a.1, &b.1) {
-                (
+        // Sort chronologically; at equal ticks NoteOff goes first so a note that ends where
+        // the next begins is released before the retrigger. A plain key (false < true)
+        // keeps this a total order, and the sort is stable for everything else.
+        events.sort_by_key(|(tick, kind)| {
+            (
+                *tick,
+                !matches!(
+                    kind,
                     TrackEventKind::Midi {
                         message: MidiMessage::NoteOff { .. },
                         ..
-                    },
-                    _,
-                ) => std::cmp::Ordering::Less,
-                (
-                    _,
-                    TrackEventKind::Midi {
-                        message: MidiMessage::NoteOff { .. },
-                        ..
-                    },
-                ) => std::cmp::Ordering::Greater,
-                _ => std::cmp::Ordering::Equal,
-            })
+                    }
+                ),
+            )
         });
 
         // Convert absolute ticks to delta ticks
@@ -454,6 +456,80 @@ mod tests {
         assert!(
             !ids.contains(&new_id),
             "new id {new_id} collides with {ids:?}"
+        );
+    }
+
+    fn chord_project(tracks: usize) -> Project {
+        let mut p = Project::new("ch");
+        for n in 0..tracks {
+            let tid = p.alloc();
+            let mut t = Track::new(tid, format!("T{n}"), TrackKind::instrument(Waveform::Sine));
+            let nid = p.alloc();
+            t.notes.push(Note {
+                id: nid,
+                start: 0,
+                duration: 480,
+                pitch: 60,
+                velocity: 100,
+                lyric: None,
+                expression: None,
+            });
+            p.tracks.push(t);
+        }
+        p
+    }
+
+    #[test]
+    fn export_never_uses_the_percussion_channel() {
+        for i in 0..64 {
+            let ch = midi_channel(i).as_int();
+            assert!(ch != 9 && ch <= 15, "track {i} -> channel {ch}");
+        }
+        let bytes = export_midi(&chord_project(20)).unwrap();
+        let smf = Smf::parse(&bytes).unwrap();
+        let mut used = std::collections::BTreeSet::new();
+        for track in &smf.tracks {
+            for e in track {
+                if let TrackEventKind::Midi { channel, .. } = e.kind {
+                    used.insert(channel.as_int());
+                }
+            }
+        }
+        assert!(!used.contains(&9), "channels used: {used:?}");
+        assert_eq!(used.len(), 15);
+    }
+
+    #[test]
+    fn export_releases_a_note_before_retriggering_the_same_pitch() {
+        let mut p = Project::new("legato");
+        let tid = p.alloc();
+        let mut t = Track::new(tid, "T", TrackKind::instrument(Waveform::Sine));
+        for (i, start) in [0u32, 480].into_iter().enumerate() {
+            t.notes.push(Note {
+                id: 10 + i as u32,
+                start,
+                duration: 480,
+                pitch: 60,
+                velocity: 100,
+                lyric: None,
+                expression: None,
+            });
+        }
+        p.tracks.push(t);
+        let smf_bytes = export_midi(&p).unwrap();
+        let smf = Smf::parse(&smf_bytes).unwrap();
+        let mut tick = 0u32;
+        let mut at_480 = vec![];
+        for e in &smf.tracks[1] {
+            tick += e.delta.as_int();
+            if let (480, TrackEventKind::Midi { message, .. }) = (tick, e.kind) {
+                at_480.push(matches!(message, MidiMessage::NoteOff { .. }));
+            }
+        }
+        assert_eq!(
+            at_480,
+            vec![true, false],
+            "NoteOff must precede NoteOn at tick 480"
         );
     }
 }

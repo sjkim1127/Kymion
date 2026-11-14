@@ -61,6 +61,16 @@ async function playNotePreview(trackId, pitch, duration = 0.35, velocity = 100) 
   }
 }
 
+// Replace the active engine and release the old wasm-side project. wasm-bindgen objects are
+// not garbage collected, so without free() every project load would leak the previous one
+// (including its embedded audio and undo history). The new engine is built first, so a
+// failed load leaves the current project untouched.
+function setEngine(next) {
+  const old = eng;
+  eng = next;
+  try { old?.free(); } catch {}
+}
+
 const light = () => JSON.parse(eng.project_json_light());
 const track = () => P?.tracks.find((t) => t.id === sel);
 const spt = () => 60 / (P.tempo * PPQ);                    // seconds per tick
@@ -95,7 +105,7 @@ window.kymion = {
   project: () => light(),
   schema: () => JSON.parse(KymionEngine.schema()),
   analysis: () => JSON.parse(eng.analysis_json()),
-  importMidi: (bytes) => { eng = KymionEngine.import_midi(bytes); refresh(); },
+  importMidi: (bytes) => { setEngine(KymionEngine.import_midi(bytes)); refresh(); },
   exportMidi: () => eng.export_midi(),
   play: () => play(), stop: () => stopAll(), get playhead() { return curTick(); },
   meters: () => JSON.parse(eng.meter_levels(foldLoopSamples(streamPos), 2048)),
@@ -797,6 +807,16 @@ function foldLoopSamples(pos) {
   return le > ls && pos >= le ? ls + ((pos - ls) % (le - ls)) : pos;
 }
 
+// Last audible tick: end of the latest note/clip plus the engine's 2 s effect tail.
+function songEndTick() {
+  let end = 0;
+  for (const t of P.tracks) {
+    for (const n of t.notes) end = Math.max(end, n.start + n.duration);
+    for (const c of t.clips) end = Math.max(end, c.start + clipLen(c));
+  }
+  return end + 2 / spt();
+}
+
 function onWorkletMessage(msg) {
   if (msg.type === "status") {
     workletBuffered = msg.buffered;
@@ -804,6 +824,11 @@ function onWorkletMessage(msg) {
       const sr = eng.sample_rate();
       const heardPos = foldLoopSamples(msg.totalSamples);
       playhead = (heardPos / sr) / spt();
+      // render_slice() returns silence past the end forever: stop (unless looping)
+      if (playing && !P.loop_region && playhead >= songEndTick()) {
+        stopAll();
+        return;
+      }
       updatePos();
 
       // Master meter display
@@ -1406,11 +1431,11 @@ const download = (name, data, type) => {
 $("wav").onclick = () => download("kymion.wav", eng.wav(), "audio/wav");
 $("save").onclick = () => download("project.kymion.json", eng.project_json(), "application/json");
 $("load").onclick = () => $("file").click();
-$("file").onchange = async (e) => { try { eng = KymionEngine.load(await e.target.files[0].text()); peaksCache.clear(); refresh(); } catch (err) { log("ERROR: " + err); } };
+$("file").onchange = async (e) => { try { setEngine(KymionEngine.load(await e.target.files[0].text())); peaksCache.clear(); refresh(); } catch (err) { log("ERROR: " + err); } };
 $("export-midi").onclick = () => { try { download("project.mid", eng.export_midi(), "audio/midi"); log("Exported MIDI."); } catch (e) { log("MIDI Export Error: " + e); } };
 $("import-midi").onclick = () => $("midi-file").click();
 async function loadMidi(file) {
-  try { eng = KymionEngine.import_midi(new Uint8Array(await file.arrayBuffer())); peaksCache.clear(); sel = null; refresh(); log(`Imported MIDI "${file.name}".`); }
+  try { setEngine(KymionEngine.import_midi(new Uint8Array(await file.arrayBuffer()))); peaksCache.clear(); sel = null; refresh(); log(`Imported MIDI "${file.name}".`); }
   catch (e) { log("MIDI Import Error: " + e); }
 }
 $("midi-file").onchange = (e) => e.target.files[0] && loadMidi(e.target.files[0]);
@@ -1479,7 +1504,7 @@ addEventListener("drop", async (e) => {
   const f = e.dataTransfer?.files[0]; if (!f) return;
   const n = f.name.toLowerCase();
   if (/\.midi?$/.test(n)) loadMidi(f);
-  else if (n.endsWith(".json")) { eng = KymionEngine.load(await f.text()); peaksCache.clear(); refresh(); log(`Loaded project "${f.name}".`); }
+  else if (n.endsWith(".json")) { setEngine(KymionEngine.load(await f.text())); peaksCache.clear(); refresh(); log(`Loaded project "${f.name}".`); }
   else if (n.endsWith(".sf2") || n.endsWith(".soundfont")) importSoundfontFile(f);
   else importAudioFile(f);
 });

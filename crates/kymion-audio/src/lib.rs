@@ -2,8 +2,8 @@
 
 use kymion_core::{
     eval_auto, ClashSeverity, DiagnosticReport, FrequencyBand, FrequencyClash, FxInstance, FxKind,
-    LufsReport, Project, SoundfontConfig, SynthConfig, SynthFilter, Track, TrackKind, Waveform,
-    PPQ,
+    LufsReport, Project, SoundfontAsset, SoundfontConfig, SynthConfig, SynthFilter, Track,
+    TrackKind, Waveform, PPQ,
 };
 use kymion_dsp::{
     midi_to_hz, Adsr, AnalogAdsr, Compressor, Eq3Band, Filterbank6, KWeightingFilter, MoogLadder,
@@ -11,12 +11,40 @@ use kymion_dsp::{
 };
 use kymion_vocal::{render_track as render_vocal, FormantVoice};
 use serde::Serialize;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct SoundfontPresetInfo {
     pub bank: u16,
     pub preset: u16,
     pub name: String,
+}
+
+/// Recently used parsed SoundFonts. Parsing a multi-megabyte SF2 for every preview note or
+/// every track of a render is the dominant cost, so keep a few around. Entries hold the
+/// asset's `Arc<str>` payload, which keeps its address unique while cached.
+static SF_CACHE: Mutex<Vec<(Arc<str>, Arc<rustysynth::SoundFont>)>> = Mutex::new(Vec::new());
+const SF_CACHE_SLOTS: usize = 4;
+
+/// Parse (or fetch from the cache) the SoundFont stored in a project asset.
+fn load_soundfont(asset: &SoundfontAsset) -> Option<Arc<rustysynth::SoundFont>> {
+    let mut cache = SF_CACHE.lock().ok()?;
+    if let Some(pos) = cache.iter().position(|(d, _)| Arc::ptr_eq(d, &asset.data)) {
+        let entry = cache.remove(pos);
+        let sf = entry.1.clone();
+        cache.push(entry); // most recently used goes last
+        return Some(sf);
+    }
+    let bytes = asset.bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let sf = Arc::new(rustysynth::SoundFont::new(&mut std::io::Cursor::new(bytes)).ok()?);
+    if cache.len() >= SF_CACHE_SLOTS {
+        cache.remove(0);
+    }
+    cache.push((asset.data.clone(), sf.clone()));
+    Some(sf)
 }
 
 pub fn list_soundfont_presets(bytes: &[u8]) -> Vec<SoundfontPresetInfo> {
@@ -193,15 +221,9 @@ fn render_soundfont_into(
     let Some(sf_asset) = p.soundfonts.iter().find(|sf| sf.id == sf_cfg.asset) else {
         return;
     };
-    let sf_bytes = sf_asset.bytes();
-    if sf_bytes.is_empty() {
-        return;
-    }
-    let mut cursor = std::io::Cursor::new(sf_bytes);
-    let Ok(soundfont) = rustysynth::SoundFont::new(&mut cursor) else {
+    let Some(soundfont) = load_soundfont(sf_asset) else {
         return;
     };
-    let soundfont = std::sync::Arc::new(soundfont);
     let settings = rustysynth::SynthesizerSettings::new(sr as i32);
     let Ok(mut synth) = rustysynth::Synthesizer::new(&soundfont, &settings) else {
         return;
@@ -294,15 +316,9 @@ pub fn render_single_note_soundfont(
     let Some(sf_asset) = p.soundfonts.iter().find(|sf| sf.id == sf_cfg.asset) else {
         return;
     };
-    let sf_bytes = sf_asset.bytes();
-    if sf_bytes.is_empty() {
-        return;
-    }
-    let mut cursor = std::io::Cursor::new(sf_bytes);
-    let Ok(soundfont) = rustysynth::SoundFont::new(&mut cursor) else {
+    let Some(soundfont) = load_soundfont(sf_asset) else {
         return;
     };
-    let soundfont = std::sync::Arc::new(soundfont);
     let settings = rustysynth::SynthesizerSettings::new(sr as i32);
     let Ok(mut synth) = rustysynth::Synthesizer::new(&soundfont, &settings) else {
         return;
@@ -557,11 +573,13 @@ fn add_metronome(p: &Project, l: &mut [f32], r: &mut [f32], sr: u32) {
     let srf = sr as f32;
     let beat = p.beat_ticks();
     let blip = (0.04 * srf) as usize;
+    // length_ticks() decodes every audio asset: compute it once, not once per beat
+    let last_tick = p.length_ticks().saturating_add(p.bar_ticks());
     let mut b = 0u32;
     loop {
-        let tick = b * beat;
+        let tick = b.saturating_mul(beat);
         let start = (p.ticks_to_secs(tick) * srf) as usize;
-        if start >= l.len() || tick > p.length_ticks() + p.bar_ticks() {
+        if start >= l.len() || tick > last_tick {
             break;
         }
         let down = b.is_multiple_of(p.time_sig_num.max(1) as u32);
@@ -904,6 +922,37 @@ pub fn decode_wav(bytes: &[u8]) -> Result<(u32, Vec<f32>), String> {
     Ok((spec.sample_rate, mono))
 }
 
+/// Minimum sustained overlap: 1.0 second (10 frames @ 100 ms).
+const MIN_CLASH_FRAMES: usize = 10;
+
+/// Overlap score (0..1) if tracks `a` and `b` clash in `band_idx` during frame `f`.
+fn frame_clash_overlap(
+    a: &TrackBandEnergy,
+    b: &TrackBandEnergy,
+    f: usize,
+    band_idx: usize,
+) -> Option<f32> {
+    let ea = a.band_rms[f][band_idx];
+    let eb = b.band_rms[f][band_idx];
+    let tot_a: f32 = a.band_rms[f].iter().sum();
+    let tot_b: f32 = b.band_rms[f].iter().sum();
+    if tot_a <= 0.005 || tot_b <= 0.005 {
+        return None;
+    }
+    let share_a = ea / tot_a;
+    let share_b = eb / tot_b;
+
+    // Clash occurs if both tracks concentrate significant energy in this band (>18%),
+    // or if their absolute levels in this band are comparable and audible.
+    let is_spectral_clash = share_a > 0.18 && share_b > 0.18 && ea > 0.002 && eb > 0.002;
+    let is_level_clash = ea > 0.005 && eb > 0.005 && (ea.min(eb) / ea.max(eb)) > 0.35;
+    if is_spectral_clash || is_level_clash {
+        Some((share_a.min(share_b) / share_a.max(share_b)).max(ea.min(eb) / ea.max(eb)))
+    } else {
+        None
+    }
+}
+
 pub fn detect_frequency_clashes(energies: &[TrackBandEnergy]) -> Vec<FrequencyClash> {
     let mut clashes = Vec::new();
     let num_tracks = energies.len();
@@ -921,38 +970,35 @@ pub fn detect_frequency_clashes(energies: &[TrackBandEnergy]) -> Vec<FrequencyCl
             }
 
             for band_idx in 0..6 {
+                // Only count *contiguous* runs of at least MIN_CLASH_FRAMES frames, so scattered
+                // single frames over a long song do not add up to a "sustained" clash.
                 let mut clash_frames = 0usize;
                 let mut sum_overlap = 0.0f32;
-
-                for f in 0..num_frames {
-                    let ea = a.band_rms[f][band_idx];
-                    let eb = b.band_rms[f][band_idx];
-
-                    let tot_a: f32 = a.band_rms[f].iter().sum();
-                    let tot_b: f32 = b.band_rms[f].iter().sum();
-
-                    if tot_a > 0.005 && tot_b > 0.005 {
-                        let share_a = ea / tot_a;
-                        let share_b = eb / tot_b;
-
-                        // Clash occurs if both tracks concentrate significant energy in this band (>18%),
-                        // or if their absolute levels in this band are comparable and audible.
-                        let is_spectral_clash =
-                            share_a > 0.18 && share_b > 0.18 && ea > 0.002 && eb > 0.002;
-                        let is_level_clash =
-                            ea > 0.005 && eb > 0.005 && (ea.min(eb) / ea.max(eb)) > 0.35;
-
-                        if is_spectral_clash || is_level_clash {
-                            let overlap = (share_a.min(share_b) / share_a.max(share_b))
-                                .max(ea.min(eb) / ea.max(eb));
-                            clash_frames += 1;
-                            sum_overlap += overlap;
+                let (mut run_frames, mut run_overlap) = (0usize, 0.0f32);
+                for f in 0..=num_frames {
+                    // `f == num_frames` is a sentinel that flushes the final run
+                    let hit = if f < num_frames {
+                        frame_clash_overlap(a, b, f, band_idx)
+                    } else {
+                        None
+                    };
+                    match hit {
+                        Some(o) => {
+                            run_frames += 1;
+                            run_overlap += o;
+                        }
+                        None => {
+                            if run_frames >= MIN_CLASH_FRAMES {
+                                clash_frames += run_frames;
+                                sum_overlap += run_overlap;
+                            }
+                            run_frames = 0;
+                            run_overlap = 0.0;
                         }
                     }
                 }
 
-                // Minimum threshold: 1.0 second of sustained overlap (10 frames @ 100ms)
-                if clash_frames >= 10 {
+                if clash_frames >= MIN_CLASH_FRAMES {
                     let avg_overlap = sum_overlap / clash_frames as f32;
                     let duration_sec = clash_frames as f32 * 0.1;
                     let band = FrequencyBand::ALL[band_idx];
@@ -1505,6 +1551,129 @@ mod tests {
             limiter: None,
         });
         assert_eq!(z.true_peak_db, -120.0);
+    }
+
+    fn energy(id: u32, name: &str, frames: &[bool]) -> TrackBandEnergy {
+        // band 3 (500-2000 Hz) loud on "on" frames, silence otherwise
+        TrackBandEnergy {
+            id,
+            name: name.into(),
+            band_rms: frames
+                .iter()
+                .map(|&on| {
+                    if on {
+                        [0.0, 0.0, 0.0, 0.05, 0.0, 0.0]
+                    } else {
+                        [0.0; 6]
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn clash_requires_a_contiguous_sustained_run() {
+        // 20 overlapping frames, but scattered one at a time: not a sustained clash
+        let scattered: Vec<bool> = (0..40).map(|i| i % 2 == 0).collect();
+        let c = detect_frequency_clashes(&[energy(1, "a", &scattered), energy(2, "b", &scattered)]);
+        assert!(c.is_empty(), "scattered frames must not count: {c:?}");
+
+        // 12 contiguous frames (1.2 s) among silence: a real clash
+        let mut run = vec![false; 5];
+        run.extend(vec![true; 12]);
+        run.extend(vec![false; 5]);
+        let c = detect_frequency_clashes(&[energy(1, "a", &run), energy(2, "b", &run)]);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert!((c[0].clash_duration_sec - 1.2).abs() < 1e-4);
+
+        // a run that reaches the very end of the song is still counted
+        let tail: Vec<bool> = (0..20).map(|i| i >= 5).collect();
+        let c = detect_frequency_clashes(&[energy(1, "a", &tail), energy(2, "b", &tail)]);
+        assert_eq!(c.len(), 1, "{c:?}");
+
+        // a short run (0.9 s) is ignored
+        let short: Vec<bool> = (0..20).map(|i| (3..12).contains(&i)).collect();
+        assert!(
+            detect_frequency_clashes(&[energy(1, "a", &short), energy(2, "b", &short)]).is_empty()
+        );
+    }
+
+    const MINIMAL_SF2: &[u8] = include_bytes!("../tests/fixtures/minimal.sf2");
+
+    #[test]
+    fn soundfont_is_parsed_once_and_renders() {
+        let mut e = Engine::default();
+        let sf = e.import_soundfont("min", MINIMAL_SF2);
+        let t = e
+            .apply(Command::AddTrack {
+                name: "sf".into(),
+                kind: TrackKind::instrument(Waveform::Sine),
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
+        e.apply(Command::SetTrackSoundfont {
+            track: t,
+            soundfont: Some(SoundfontConfig {
+                asset: sf,
+                bank: 0,
+                preset: 0,
+            }),
+        })
+        .unwrap();
+
+        let asset = &e.project.soundfonts[0];
+        let first = load_soundfont(asset).expect("fixture is a valid SF2");
+        let second = load_soundfont(asset).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "second load must hit the cache"
+        );
+
+        let s = render_note_preview(&e.project, t, 60, 0.3, 100);
+        let peak = s.left.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        assert!(peak > 0.001, "SoundFont preview was silent: {peak}");
+
+        // payloads that are not SoundFonts are rejected and never cached
+        let bad = SoundfontAsset::from_bytes(99, "bad", b"not a soundfont");
+        assert!(load_soundfont(&bad).is_none());
+        let empty = SoundfontAsset::from_bytes(100, "empty", b"");
+        assert!(load_soundfont(&empty).is_none());
+        assert_eq!(list_soundfont_presets(MINIMAL_SF2).len(), 1);
+    }
+
+    #[test]
+    fn metronome_click_count_matches_beats() {
+        let mut e = Engine::default();
+        let asset = e.import_audio("tone", 44100, &vec![0.0; 44100 * 4]);
+        let a = e
+            .apply(Command::AddTrack {
+                name: "a".into(),
+                kind: TrackKind::Audio,
+            })
+            .unwrap()
+            .track_id
+            .unwrap();
+        e.apply(Command::AddClip {
+            track: a,
+            asset,
+            start: 0,
+            gain: None,
+            offset_ticks: None,
+            duration_ticks: None,
+        })
+        .unwrap();
+        // silent audio: any energy comes from the metronome alone
+        let s = render_with(&e.project, &RenderOptions { metronome: true });
+        let clicks = s
+            .left
+            .chunks(441)
+            .filter(|c| c.iter().any(|x| x.abs() > 0.01))
+            .count();
+        assert!(
+            clicks >= 8,
+            "4 s at 120 bpm is >= 8 beats, got {clicks} loud blocks"
+        );
     }
 
     #[test]
